@@ -94,15 +94,16 @@ class Mpu:
         #start the mpy abd store the mpu details with the store
         self.mpu = self.store.fs.call_s3("create_multipart_upload", Bucket=self.bucket, Key=self.key, **mpu_options)
 
-
+    
     def upload_part_mpu(self, PartNumber, data):
-        """
-        uploads a part to a multipart upload
+        """Uploads a part to a multipart upload.
 
-        store is an fsspec mapping with an mpu attribute added by create_mpu
-        data is what to write to the part - note some size limitation from s3
+        Args:
+            part_number: The number of the part to upload.
+            data: The data to upload.
 
-        returns mpu part information
+        Returns:
+            A dictionary containing the part information.
         """
         if self.finalised:
             return
@@ -116,6 +117,19 @@ class Mpu:
         )
         return {"PartNumber": PartNumber, "ETag": part_mpu["ETag"]}
 
+    def upload_parts_mpu(self, write_parts):
+        """Uploads multiple part to a multipart upload.
+
+        Args:
+            an iterable of tuples where the first value is the
+            part_number: The number of the part to upload.
+            and the second value is the
+            data: The data to upload.
+
+        Returns:
+            A list of dictionaries containing the part information.
+        """
+        return [self.upload_part_mpu(i, part_data) for i,part_data in write_parts]
 
     def complete_mpu(self, mpu_parts):
         """

@@ -2,6 +2,8 @@ __all__ = ['write_ccog']
 
 from contextlib import suppress
 from itertools import count
+from collections import deque
+import math
 import io
 import struct
 import xml.etree.ElementTree as ET
@@ -35,8 +37,9 @@ required_creation_options = dict(
     sparse_ok=True,
     driver="COG",
     bigtiff="YES",
-    num_threads="all_cpus",
+    num_threads="all_cpus", #TODO: tet what difference this makes if any on a dask cluster
     overviews="AUTO",
+    JPEGTABLESMODE = 0, #not tested but will be needed when I get to multiband compressed data- does it work with the GDAL COG driver? 
 )
 
 default_creation_options = dict(
@@ -46,65 +49,17 @@ default_creation_options = dict(
 
 )
 
-#thoughts around how to
-# break a COG down to good sized chunks
-#
-# its a balance between:
-# s3 multipart upload limits minimum size of 5MiB per part (note total combined maximum size of 5TiB)
-# and maximum of 10,000 parts
-# bigger parts get more overviews calculated and therefore less data needs to be transfured to do courser overview creation
-# spreading the load between dask workers/threads - ideally 1 or a few parts per thread.
-# not overloading worker memory
-# working with source data chunks - cant really adjust for this as the COG output tile/overview structure is very strict.
-# chunks MUST be aligned to one of the overview levels
-# Therefore, I think the goal is big chunks that dont overload memory.
-# in the place of automatically analysing the specs of the cluster tune for a typical cluster worker
-# For a small array on a big cluster this may leave some workers idle. so be it.
-
-
-#related links/projects
-#cog standard https://portal.ogc.org/files/102116?utm_source=phplist879&utm_medium=email&utm_content=HTML&utm_campaign=OGC+seeks+public+comment+on+Cloud+Optimized+GeoTIFF+%28COG%29+Standard
-#https://pypi.org/project/large-image-converter/
-#interesting tequnique for partially updateing a s3 key https://stackoverflow.com/questions/38069985/replacing-bytes-of-an-uploaded-file-in-amazon-s3
-#cogger https://github.com/airbusgeo/cogger
-#rioxarray
-#https://pypi.org/project/tifftools/
-#https://github.com/cgohlke/tifffile
-#a timely warning about s3 costs https://pancho.dev/posts/watch_out_cloud_storage/
-#many others
-
-#waiting on gdal 3.6
-#it allows my to force creation of overview levels beyond what is needed for normal users
-#it fixed a writing bug i identified for long thin COGs
-#however for now as long as the input data fills full sized chunks at the level used then ccog should work fine
-
-#not tested with
-# more then 1 band
-# with masks
-# dtypes other then float32
-#different copressions schemes - shouldnt be any issue
-# a range of resample types - some resampling types may not transistion well between the finer levels and the course levels.
-#various nodata values - handling of nodata is a bit haphazard - should work with np.nan
-#different compression for different tiff pages
-
-#interesting things to consider
-#  multi multi part upload !! https://en.wikipedia.org/wiki/Epizeuxis
-#- multipart upload to s3 is limited to 10000 parts. to get around this parts can be put into multiple temp files on s3 and then
-#     a new multipart file is produced and s3.upload_part_copy can be used to assemble the temp files
-# - a similar approach could be used to rearrange a ccog file into a stricter cog format. as a post processign step.
-#    care would need to be taken to not cross the min/max part size limits
-#    max could be avoided jsut by splitting a part
-#    min could be avoided by downloading enough small bits locally to be able to provide a 50MiB part and then upload_part.
-
-def get_maximum_overview_level(width, height, minsize=256):
+def get_maximum_overview_level(width, height, minsize=256,overview_count=None):
     """
+    Calculate the maximum overview level of a dataset at which
+    the smallest overview is smaller than `minsize`.
+    
     Based on rasterio.rio.overview.get_maximum_overview_level
     modified to match the behaviour of the gdal COG driver
     so that the smallest overview is smaller than `minsize` in BOTH width and height.
     
-    
-    Calculate the maximum overview level of a dataset at which
-    the smallest overview is smaller than `minsize`.
+    modified to have different behaviour to rasterio and GDAL
+    wont produce more overview levels once one dimension has reduced to 1 pixel.
     Attributes
     ----------
     width : int
@@ -118,13 +73,26 @@ def get_maximum_overview_level(width, height, minsize=256):
     overview_level: int
         overview level.
     """
+    #note GDAL seems to have a limit of an overview level of 30
+    
+    #GDAL will keep producing overviews for single pixel strands of data longer then blocksize.
+    #this is a bit odd because the resampling doesnt make sense
+    #here limit overviews when min dimension is 1.
+
     overview_level = 0
     overview_factor = 1
-    while max(width // overview_factor, height // overview_factor) > minsize:
-        overview_factor *= 2
-        overview_level += 1
+    if overview_count is not None:
+        while overview_count > overview_level and min(width // overview_factor, height // overview_factor) > 1:
+            overview_factor *= 2
+            overview_level += 1 
+            print (width // overview_factor, height // overview_factor)
+    else:
+        while max(width // overview_factor, height // overview_factor) > minsize and min(width // overview_factor, height // overview_factor) > 1:
+            overview_factor *= 2
+            overview_level += 1
 
     return overview_level
+
 
 def xarray_to_profile(x_arr):
     profile = dict(        
@@ -145,9 +113,6 @@ def empty_single_band_vrt(**profile):
 
     Its used as a starting point to create an empty COG file
 
-
-
-
     Parameters
     ----------
     Returns
@@ -163,8 +128,7 @@ def empty_single_band_vrt(**profile):
 
     #     The existing dataset doesnt need to be a VRT but experimentation has shown that this VRT
     #     is faster then the other empty datasets Ive tried as starting points.
-    #     Of particular benefit is the inclusion of an OverviewList and then using the COG driver
-    #     option of OVERVIEWS = 'FORCE_USE_EXISTING'
+    #     Of particular benefit is the inclusion of an OverviewList
     #     It seems that building overviews, even if empty and sparse is the slow part of making a COG.
 
     #     An alternative approach to produce the vrt xml written in this code
@@ -173,9 +137,8 @@ def empty_single_band_vrt(**profile):
     #     The code below produces an output identical to the above steps but this implementation 
     #     is prefered as it is more direct and hopefully clearer
     
-    overview_level = get_maximum_overview_level(profile['width'], profile['height'], minsize=profile['blocksize'])
-    overviews = " ".join([str(2**j) for j in range(1, overview_level + 1)])
-
+    overviews = " ".join([str(2**j) for j in range(1, profile['overview_count'] + 1)])
+    
     # based on code in rasterio https://github.com/rasterio/rasterio/blob/main/rasterio/vrt.py
     vrtdataset = ET.Element("VRTDataset")
     vrtdataset.attrib["rasterXSize"] = str(profile['width'])
@@ -225,116 +188,77 @@ def empty_single_band_COG(profile,rasterio_env_options=None):
             data = memfile.read()
     return data
 
+def delete_COG_ghost_header(memfile):
+    '''If messing with the gdal COG block order optimisations its likely a good idea to let GDAL know about it in the ghost header
+    its a little annoying to have to fully switch off the optimisations as its still 'mostly' got all the optimisations in place
+    Ive not tested what GDAL does if if I dont switch off this optimisation. 
+    GDAL complains if I only modify the header so im removing it fully. Leaving the space as its only a few hundred bytes.
+    '''
+    assert not memfile.closed, "memory file was closed before writing"
+    memfile.seek(16+30)
+    GDAL_STRUCTURAL_METADATA_SIZE = int(memfile.read(6))
+    memfile.seek(16)
+    memfile.write((43+GDAL_STRUCTURAL_METADATA_SIZE)*b"\0")
+    memfile.seek(0)
+    return
+
 def partial_COG_maker(
     arr,
-    writeLastOverview,
     profile,
     rasterio_env_options,
 ):
     """
-    writes arr to a in memory COG file and the pulls the COG file apart and returns it in parts that are useful for
+    writes arr to an in memory COG file and the pulls the COG file apart and returns it in parts that are useful for
     reconstituting it differently.
-    Gets all the advantages of GDALs work writing the file so dont need to do that work from scratch.
-    writeLastOverview If False the last overview is not included in imagedata ,TileOffsets, TileByteCounts
-
+    Gets all the advantages of rasterio/GDALs work writing the file so dont need to do that work from scratch.
     """
     profile = profile.copy() #careful not to update in place
     profile['height']= arr.shape[0]
     profile['width']= arr.shape[1]
     #not using the transform in profile as its going to be wrong - make it obviously wrong avoids rasterio warnings
     profile['transform']= Affine.scale(2)
-
+    #the overview is only used for resampling its not stored
+    profile["overview_count"] = 1
+    profile["overview_compress"] = 'NONE'
+    
+    print (profile)
+    shp = arr.shape
     with rasterio.Env(**rasterio_env_options):
         with rasterio.io.MemoryFile() as memfile:
             with memfile.open(**profile) as src:
                 src.write(arr, 1)
                 del arr  # reducing mem footprint
-                
-                #gdal <3.6 doesnt understand "overview_count" so 
-                #forcing overview building for the number of levels needed
-                #next  2 lines can likely be removed if support is limited to gdal >= 3.6
-                factors = [2**j for j in range(1, profile['overview_count'] + 1)]
-                src.build_overviews(factors, profile['overview_resampling'])
+            
+            #need to stop gdal producing overviews that should shrink to nothing.
+            #however note that GDAL wont do this for a whole image so there is an edge case inconsistency here
+            overview_arr = None
+            if min(shp)>1:
+                with memfile.open(overview_level=0) as src:
+                    # get the required overview back as an array
+                    overview_arr = src.read(1)
 
-            with memfile.open(overview_level=profile['overview_count'] - 1) as src:
-                # get the required overview back as an array
-                outarr = src.read(1)
- 
+            #removing the gdal ghost leaders
+            part_bytes = []
             memfile.seek(0)
-
-            #gdal/rasterio dont make it easy to access and manipulate offsets and counts tifffile does :-)
-            lim = None if writeLastOverview else profile['overview_count']
+            #return (memfile.read()) #used for testing
             with tifffile.TiffFile(memfile) as tif:
-                TileOffsets = [page.tags['TileOffsets'].value for page in tif.pages[0:lim]]
-                TileByteCounts = [page.tags['TileByteCounts'].value for page in tif.pages[0:lim]]
-
-            # assume the very strict COG layout from GDAL get the image data for all except the highest overview
-            # keep the gdal ghost leader - not sure its going to be much use but all the other tiles will have it so keep it for the first one to be consistant
-            #keeping it also maintains the offset of '0' as having special meaning
-            gdal_ghost_offset = 4
-            # find the offset to the first tile of image data
-            pos_offsets = [i for l in TileOffsets for i in l if i > 0]  
-            imagedata = b''
-            if len(pos_offsets) > 0:
-                # its not all nodata
-                image_offset = min(pos_offsets) - gdal_ghost_offset
-                TileOffsets = [[v - image_offset if v else 0 for v in l] for l in TileOffsets]
-                memfile.seek(image_offset)
-                imagedata = memfile.read()
-
-            # offsets and counts will be more useful as 2d numpy arrays
-            # level -1 is the full res data - also accessed with overview_level=None
-            for ov in range(len(TileOffsets)):
-                with memfile.open(overview_level=ov - 1) as src:
-                    last_window_indicies = list(src.block_windows(-1))[-1][0]
-                    blocks_shp = (last_window_indicies[0]+1,last_window_indicies[1]+1)
-                    TileOffsets[ov] = np.array(TileOffsets[ov], dtype=np.int64).reshape(blocks_shp)
-                    TileByteCounts[ov] = np.array(TileByteCounts[ov], dtype=np.int64).reshape(blocks_shp)
-
-    return (outarr, TileOffsets, TileByteCounts, imagedata)
-
-def tif_part_writer(
-    block, i, mpu_store, writeLastOverview, pad, profile, rasterio_env_options,
-):
+                page = tif.pages[0]
+            for offset, bytecount in zip(page.dataoffsets, page.databytecounts):
+                _ = memfile.seek(offset)
+                part_bytes.append(memfile.read(bytecount))
     
-    outarr, TileOffsets, TileByteCounts, imagedata = partial_COG_maker(
-        block, writeLastOverview=writeLastOverview, profile=profile, rasterio_env_options=rasterio_env_options,
-    )
-    #only make a part if there is data in the part
-    part = None
-    if len(imagedata):
-        if pad:
-            # extend the file so that imagedata is at least pad bytes long due to s3 minimum file size
-            imagedata = imagedata.ljust(pad, b"\0")
-        assert len(imagedata) <= s3_max_part_bytes , 'part too big for s3 part upload'
-        part = mpu_store.upload_part_mpu(i, imagedata)
+    # data will be more flexible later as 2d numpy arrays
+    tile_col_count = math.ceil(page.imagewidth/page.tilewidth)
+    part_bytes = np.array(part_bytes,dtype=object).reshape(tile_col_count,-1)
 
-    data_len = len(imagedata)
-    #print (i,writeLastOverview,profile)
-    return outarr, (part, data_len, TileOffsets, TileByteCounts)
-
-def modify_COG_ghost_header(memfile):
-    '''If messing with the gdal COG block order optimisations its likely a good idea to let GDAL know about it in the ghost header
-    its a little annoying to have to fully switch off the optimisations as its still 'mostly' got all the optimisations in place
-    Ive not tested what GDAL does if if I dont switch off this optimisation. 
-    I would hope that it has some sanity checks that stop to deal with blocks that are out of order and doesnt try and read massive amounts of data for getting a small tile?
-    quick and dirty way to do it but assumes this structure isnt likely to change and if it does and breaks this code then likely other assumptions need fixing.
-    todo: ask gdal maintainers about doing this and its impacts.
-    '''
-    assert not memfile.closed, "memory file was closed before writing"
-    memfile.seek(83)
-    assert memfile.read(21) == b'BLOCK_ORDER=ROW_MAJOR' , 'oh no gdal COG format changed'
-    memfile.seek(83)
-    memfile.write(b'BLOCK_ORDER=CCOG     ')#trailing space intentional - ive just made CCOG up - wonder if GDAL will even notice
-    memfile.seek(168)
-    assert memfile.read(31) == b'KNOWN_INCOMPATIBLE_EDITION=NO\n ' , 'oh no gdal COG format changed'
-    memfile.seek(168)
-    memfile.write(b'KNOWN_INCOMPATIBLE_EDITION=YES\n') #trailing space removed just like gdal would - NOTE: This change will result in GDAL giving warnings
-    memfile.seek(0)
-    return
-
-def chunk_dim(blockSize,chunk_exp):
-    return blockSize * 2 ** chunk_exp
+    #not convinced this is the correct place to produce this data - could easily be made from the part_bytes in a later step
+    #eg use np.vectorize(len)(part_bytes) to generate databytecounts
+    #this would give flexability for rearranging the data
+    databytecounts = np.array(page.databytecounts,dtype=np.int64).reshape(tile_col_count,-1)
+    #at some later stage sparse tiles (bytecount=0) need to have their offset set to zero before writing.
+    databyteoffsets = np.cumsum([0,*page.databytecounts[0:-1]],dtype=np.int64).reshape(tile_col_count,-1)
+    part_info = (databyteoffsets, databytecounts)
+    return overview_arr,part_bytes,part_info
 
 def adjust_compression(profile):
     '''
@@ -348,75 +272,188 @@ def adjust_compression(profile):
                     del profile[k] 
     for k1,k2 in [('overview_compress','compress'),('overview_quality','quality'),('overview_predictor','predictor'),]:
         if k1 in profile:
-            profile[k2] = profile[k1] 
-
-def chunk_adjuster(dask_arr,blockSize,chunk_exp = 0):
+            profile[k2] = profile[k1]
+            
+def mpu_write_planner(buffer_parts,part_bytes,end_partition=False,merge_partition=None,end_final_partition = False):
     '''
-    analyse chunks and combine edge chunks in some limited cases
+        the main place for the logic for handling partitioned writes to ranges of a mpu
+        
     '''
-    chunk_heights,chunk_widths = dask_arr.chunks
-    if chunk_exp<1:
-        chunk_exp = get_maximum_overview_level(chunk_widths[0], chunk_heights[0], minsize=blockSize)
-    #assert chunk_exp >= 1, 'chunk_exp too small'
-    #if chunk_exp == 2:
-    #    print('consider using larger chunks') #shift to logging system
-    #get here if there is more then a single chunk
-    #very small last chunks trigger different handling in gdal overview creation
-    #merge the second to last chunks if too small
-    if chunk_heights[-1] < 2**chunk_exp:
-        chunk_heights = (*chunk_heights[:-2],sum(chunk_heights[-2:]))
-    if chunk_widths[-1] < 2**chunk_exp:
-        chunk_widths = (*chunk_widths[:-2],sum(chunk_widths[-2:]))
-    dask_arr = dask_arr.rechunk(chunks=(chunk_heights,chunk_widths))
-    return(dask_arr,chunk_exp)
+    
+    #NOT FINISHED
+    
+    
+    
+    #partitions hold the first write back so enable the previous partiation to make a write if it doesnt get over the 5MiB limit.
+    #this is unavoidable unless its ok to add padding into the file at the end of a partition.
+    #this is also easier then keeping a 5MiB buffer active while writing a partitation and (and such a buffer doesnt work if there is 
+    #a partition with less then 5MiB of data to write.
+    
+    #TODO: revisit thinking about memory usage as the data buffer might be many GB and avoiding duplicating this much data is worthwhile
+    #TODO: if thinking about a row major or z order for the stored tiles this could be where it would be done.
+    #TODO: may want to trigger the first write to have an upper limit at smaller size to avoid having to keep a first data part that is say 4GiB in memory when 5MiB will do
+    #todo: ensure user limit bytes is in the valid s3 range
+    #TODO: the below logic works but its asthetically clunky. revisit with fresh eyes
+    
+    #2GiB #TODO: make user setable.
+    user_limit_bytes = 2 * 1024 * 1024 * 1024
 
-def nested_graph_builder(da,mpu_store,profile,rasterio_env_options):
+    partition_start_id,partition_end_id,next_id,queue = buffer_parts
+    
+    part_bytes = [item for item in part_bytes if item is not None]
+    queue.extend(part_bytes)
+    current_length = 0
+    current_queue = deque()
+    
+    first_write = None
+    writes = []
+    
+    while queue:
+        b = queue.popleft()
+        current_length += len(b)
+        current_queue.append(b)
+        if current_length < s3_min_part_bytes:
+            continue
+        if next_id == partition_start_id and partition_start_id != 1:
+            #first lot of data in the partition (but not the first partition) need to keep a small amount for joining partitions
+            joined_buffer = b''.join(current_queue)
+            current_queue.clear()
+            current_length = 0
+            #deal with if the data is too long (happens if a very large object is in the buffer)
+            #first write needs to have space for a small write from the previous partition if needed
+            if current_length > (s3_max_part_bytes - s3_min_part_bytes):
+                #do something to split up the data
+                #generally want to avoid spliting the chunks of data that come in but unavoidable due to large part and s3_max_part_bytes
+                queue.appendleft(joined_buffer[s3_min_part_bytes:])
+                joined_buffer = joined_buffer[:s3_min_part_bytes]
+            #store the first write
+            first_write = [joined_buffer]
+            next_id += 1
+
+        elif current_length > user_limit_bytes:
+            joined_buffer = b''.join(current_queue)
+            if current_length > s3_max_part_bytes:
+                if (current_length - len(b)) >= s3_min_part_bytes:
+                    #put the last one back
+                    queue.appendleft(current_queue.pop())
+                    joined_buffer = b''.join(current_queue)
+                else:
+                    #cant put the last one back
+                    #generally want to avoid spliting the chunks of data that come in but unavoidable due to large part and s3_max_part_bytes
+                    joined_buffer = b''.join(current_queue)
+                    queue.appendleft(joined_buffer[user_limit_bytes:])
+                    joined_buffer = joined_buffer[:user_limit_bytes]
+                
+            current_queue.clear()
+            current_length = 0
+            writes.append ([next_id,joined_buffer])
+            assert next_id <= partition_end_id, f'too many parts written in partition {partition_start_id} to {partition_end_id}'
+            next_id += 1
+            
+
+    
+    buffer_parts = [partition_start_id,partition_end_id,next_id,current_queue]
+    return first_write,writes,buffer_parts
+
+
+def COG_graph_builder(da,mpu_store,profile,rasterio_env_options):
+    '''
+    '''
+    tif_part_maker_func = dask.delayed(partial_COG_maker, nout=3)
+    mpu_write_planner_func = dask.delayed(mpu_write_planner, nout=3)
+    mpu_writer_func = dask.delayed(mpu_store.upload_parts_mpu, nout=1)
+    mpu_complete_func = dask.delayed(mpu_store.complete_mpu)
+    resolve_partition_boundaries_func = dask.delayed(resolve_partition_boundaries,nout=)
+    
+    #ensure the overview count is set
+    profile['overview_count'] = get_maximum_overview_level(profile['width'], profile['height'], minsize=profile['blocksize'],overview_count=profile.get('overview_count',None))
     profile = profile.copy()
+    overview_profile = profile.copy()
+    adjust_compression(overview_profile)
 
-    parts_info = []
-    # part ids in reverse so higher resolution data is towards the end of the cog
-    mpu_part_id_generator = count(10000,-1)
-    for level in count():
-        if level > 0:
-            adjust_compression(profile)
-        da, chunk_exp = chunk_adjuster(da, profile['blocksize'],chunk_exp = 0)
-        profile["overview_count"] = chunk_exp
+    del_profile = dask.delayed(profile,traverse=False)
+    del_overview_profile = dask.delayed(overview_profile,traverse=False)
+    del_rasterio_env_options = dask.delayed(rasterio_env_options,traverse=False)
+    current_level_profile = del_profile
+    parts_info = {}
+    parts_bytes = {}
 
+    for level in range(profile['overview_count']+1):
+        parts_info[level] = []
+        parts_bytes[level] = []
         chunk_heights, chunk_widths = da.chunks
         da_del = da.to_delayed(optimize_graph=False)
-        last = get_maximum_overview_level(chunk_widths[0], chunk_heights[0], minsize=profile['blocksize']) == 0
         res_arr = np.ndarray(da_del.shape, dtype=object)
-        #flipping as the mpu_part_id_generator decrements the counter
-        for mpu_part_id, blk in zip(mpu_part_id_generator, np.flip(da_del.ravel())):
+
+        for blk in da_del.ravel():
             ind = blk.key[1:]
-            blk_final_shape = (
-                chunk_heights[ind[0]] // 2**chunk_exp,
-                chunk_widths[ind[1]] // 2**chunk_exp,
-            )
+            overview_arr,part_bytes,part_info = tif_part_maker_func(blk,current_level_profile,del_rasterio_env_options)
+            parts_info[level].append((ind,part_info))
+            parts_bytes[level].append((ind,part_bytes))
+            blk_final_shape = (chunk_heights[ind[0]] // 2,chunk_widths[ind[1]] // 2)
+            res_arr[ind] = dask.array.from_delayed(overview_arr, shape=blk_final_shape, dtype=da.dtype)
 
-            part_writer_func = dask.delayed(tif_part_writer, nout=2)
-            outarr, part_info = part_writer_func(
-                blk,
-                i=mpu_part_id,
-                mpu_store = mpu_store,
-                writeLastOverview=last, 
-                pad=s3_min_part_bytes,
-                profile = profile,
-                rasterio_env_options = rasterio_env_options,
-                #dask_key_name=("tif_part_writer",level,ind,mpu_part_id,tokenize(ind,level,mpu_part_id,mpu_store.mpu))
-            )
-            res_arr[ind] = dask.array.from_delayed(outarr, shape=blk_final_shape, dtype=da.dtype)
-            parts_info.append((level,ind,mpu_part_id,part_info))
-        if last:
-            break
+        #if level == profile['overview_count']: #last
+        #    break
         da = dask.array.block(res_arr.tolist())
-        #copy the chunking from the initial data
+        #copy the chunking from the initial data - assuming the first chunk is indicative of appropriate chunking to use for overviews
         da = da.rechunk(chunks= (chunk_heights[0], chunk_widths[0]))
+        current_level_profile = del_overview_profile
 
-    #print (mpu_part_id)
-    if mpu_part_id < s3_start_part:
-        raise ValueError ('too many parts - try starting with larger chunks')
-    return parts_info
+    #empty_single_band_COG is slow for large COGs, its seperate here so dask can run it early
+    header_bytes = dask.delayed(empty_single_band_COG)(del_profile, rasterio_env_options= del_rasterio_env_options)
+    header_bytes_final = dask.delayed(prep_tiff_header)(header_bytes, parts_info)
+           
+    #set how many mpu parts are used in each partition. 
+    #these numbers have been determined from an analysis of the relative size of each overview 
+    #every overview after 6 goes in 1 partition
+    partition_specs =  {'header':{'start':1,'end':2,'data':[]},
+                        'last_overviews':{'start':2,'end':3,'data':[]},
+                        6:{'start':3,'end':5,'data':[]},
+                        5:{'start':5,'end':12,'data':[]},
+                        4:{'start':12,'end':42,'data':[]},
+                        3:{'start':42,'end':159,'data':[]},
+                        2:{'start':159,'end':627,'data':[]},
+                        1:{'start':627,'end':2502,'data':[]},
+                        0:{'start':2502,'end':10000,'data':[]},
+                       }
+                        
+    #rearrange the delayed data into the write partitions
+    partition_specs['header']['data']=[header_bytes_final]
+    for level in sorted(parts_bytes, reverse=True):#revese so that when levels share a partition they need to be in this order
+        partition_specs.get('level',partition_specs['last_overviews'])['data'].extend(parts_bytes[level])
+        
+    #now deal with the writing to mpu
+    mpu_parts = []
+    previous_buffer_parts = None
+    for partition in partition_specs.values():
+        first_parts = []
+        buffer_parts = [partition['start'],partition['end'],partition['start'],deque(),]
+        for parts_bytes in partition['data']:
+            first_part,write_parts,buffer_parts = mpu_write_planner_func(buffer_parts,parts_bytes)
+            first_parts.append(first_part)
+            mpu_parts.append(mpu_writer_func(write_parts))
+        #empty the buffer if possible
+        first_part,write_parts,buffer_parts = mpu_write_planner_func(buffer_parts,end_partition = True)
+        first_parts.append(first_part)
+        mpu_parts.append(mpu_writer_func(write_parts))
+        
+        partition['first_parts'] = first_parts
+        partition['buffer_parts'] = buffer_parts 
+    
+        if previous_buffer_parts is not None:
+            first_part,write_parts,buffer_parts = mpu_write_planner_func(previous_buffer_parts,first_parts,merge_partition = buffer_parts)
+            first_parts.append(first_part)
+            mpu_parts.append(mpu_writer_func(write_parts))
+        previous_buffer_parts = buffer_parts
+        
+    #write the final mpu
+    first_part,write_parts,buffer_parts = mpu_write_planner_func(buffer_parts,end_final_partition = True)
+    first_parts.append(first_part)
+    mpu_parts.append(mpu_writer_func(write_parts))
+    
+    delayed_graph = mpu_complete_func(mpu_parts)
+    return delayed_graph
 
 def ifd_updater(memfile,block_data):
     #memfile is a bytesIO object
@@ -432,34 +469,21 @@ def ifd_offset_adjustments(header_length,parts_info):
     '''
     merging of ifd data into the right order needed for the concatenated COG tif header
     also applies part offsets to the image data offsets
-    '''       
-    #apply cumulative offsets to tile offset data   
-    offset = header_length
-    #sorted by mpu_part_id
-    for level,ind,mpu_part_id,(part, data_len, TileOffsets, TileByteCounts) in sorted(parts_info, key= lambda y: y[2]):
-        for arr in TileOffsets:
-            #note this modifies in place!
-            arr[arr > 0] += offset
-        offset += data_len
-
-    #rearrange info arrays into a format that suits.
-    rearranged_info = {}
-    for level,ind,mpu_part_id,(part, data_len, TileOffsets, TileByteCounts) in sorted(parts_info):
-    #for level,ind,_,TileOffsets,TileByteCounts in sorted(parts_info.values()):
-        for level2,(to,tb) in enumerate(zip(TileOffsets,TileByteCounts)):
-            rearranged_info.setdefault((level,level2), []).append((ind,to,tb))
-
-    #second stage of rearranging into the final arrangement that is needed for the tif headers
+    '''
     block_offsets = []
     block_counts = []
-    for v in rearranged_info.values():
-        #rely on things being correctly sorted
-        #get the last 2d index and  convert it to a 2d shape
-        shp = (v[-1][0][0]+1,v[-1][0][1]+1)
-        #place all the blocks into 2d arrays
+    #apply cumulative offsets to tile offset data
+    offset = header_length
+    #the order produced is right except the levels need reversing - should match the order data is written to file
+    for level in sorted(parts_info, reverse=True):
+        shp = [xy+1 for xy in parts_info[level][-1][0]]
         TileOffsets_arr = np.ndarray(shp, dtype=object)
         TileByteCounts_arr = np.ndarray(shp, dtype=object)
-        for ind,TileOffsets,TileByteCounts in v:
+        for ind,(TileOffsets, TileByteCounts) in parts_info[level]:
+            #note this modifies in place!
+            TileOffsets[TileByteCounts > 0] += offset
+            TileOffsets[TileByteCounts == 0] = 0 #sparse tif data
+            offset = TileOffsets[-1,-1] + TileByteCounts[-1,-1]
             TileOffsets_arr[ind] = TileOffsets
             TileByteCounts_arr[ind] = TileByteCounts
         #make block arrays into arrays and then flatten them
@@ -468,59 +492,25 @@ def ifd_offset_adjustments(header_length,parts_info):
 
     return (block_offsets, block_counts)
                               
-def write_tiff_header(mpu_store,header_bytes,parts_info):
-    '''update the header and finish writing to the mpu
+def prep_tiff_header(header_bytes,parts_info):
+    '''update the header
     '''                             
-    #extend so at least s3_min_part_bytes long due to s3 minimum file size
-    header_bytes = header_bytes.ljust(s3_min_part_bytes, b"\0")
     #adjust the block data
     block_data = ifd_offset_adjustments(len(header_bytes),parts_info)
     #write the block data into the header
     with io.BytesIO(header_bytes) as memfile:
         ifd_updater(memfile,block_data)
-        modify_COG_ghost_header(memfile)
+        delete_COG_ghost_header(memfile)
         header_data = memfile.getvalue()
-
-    assert len(header_data) <= s3_max_part_bytes , 'part too big for s3 part upload'
-    parts = [part for level,ind,mpu_part_id,(part, data_len, TileOffsets, TileByteCounts) in parts_info]
-    #write the header to the first (1) mpu part
-    parts.append(mpu_store.upload_part_mpu(1, header_data))
-    mpu_store.complete_mpu(parts)
+    return header_data
     
-def chunky_checker(dask_arr,blockSize):
-    '''ccog has specific chunking requirements
-    
-    this checks that they are met
-    '''
-    valid_chunk_dims = [blockSize* 2**e for e in range(30)]#use a range bigger then ever expected
-    if len(dask_arr.chunks) != 2:
-        raise ValueError ('currently only works with 2d arrays')
-    chunk_heights,chunk_widths = dask_arr.chunks
-    if len(set(chunk_heights[:-1])) > 1 or len(set(chunk_widths[:-1]))  > 1:
-        raise ValueError ('chunking needs to be consistant (except the last in any dimension)')
-    if len(chunk_heights)>1 and len(chunk_widths)>1:
-        if chunk_heights[0] != chunk_widths[0]:
-            raise ValueError ('chunking needs to be square')
-    if len(chunk_heights)>1 :
-        if chunk_heights[-1] >= 2 * chunk_heights[0]:
-            raise ValueError ('last chunk too large')
-        if chunk_heights[0] not in valid_chunk_dims[1:] :
-            raise ValueError ('chunk size needs to be in the power of 2 series starting after blockSize')
-    if len(chunk_widths)>1 :
-        if chunk_widths[-1] >= 2 * chunk_widths[0]:
-            raise ValueError ('last chunk too large')
-        if chunk_widths[0] not in valid_chunk_dims[1:] :
-            raise ValueError ('chunk size needs to be in the power of 2 series starting after blockSize')
-
 def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = None, storage_options = None):
     '''writes a concatenated COG to S3
     x_arr an xarray array.
         notes on chunking:
         ccog is picky about chunking and will tell you about it.
-        most chunks should be square and with a dimension powers of 2 of block size 
-        so if your block size is 512 then chunks of one of 1024,2048,4096,8192,16384....etc
-        larger chunks are better - limited to your available ram
-        small chunks may result in some bloat in the final file or trigger some errors due to limitations in s3 uploads.
+        chunks should have xa nd y dimensions of multiples of the blocksize
+        the last chunk in the x  and y dimensions do not have this limitation.
     store is an s3 file path or fsspec mapping
     storage_options (dict, optional) – Any additional parameters for the storage backend
     COG_creation_options (dict, optional) – options as described here https://gdal.org/drivers/raster/cog.html#creation-options
@@ -530,14 +520,12 @@ def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = 
         gdal exposes many configuration options how (or if) any particular option works with ccog is untested
         ccog does all its work in memory so many of the commonly used gdal config options are unlikely to be useful, but the option is there if you want to try.
         They may be better used with however you open data to make your xarray. 
-        
-
     
     returns a dask.delayed object
-    
-    TODO: shortcut route if a small array can just be handled as a single part
-    TODO: work with GDAL config settings (environment)
     '''
+    #TODO: shortcut route if a small array can just be handled as a single part
+    #TODO: work with GDAL config settings (environment)
+    
     COG_creation_options = {} if COG_creation_options is None else COG_creation_options
     rasterio_env_options = {} if rasterio_env_options is None else rasterio_env_options
     storage_options = {} if storage_options is None else storage_options
@@ -550,9 +538,8 @@ def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = 
     #normalise keys to lower case for ease of referencing
     user_creation_options = {key.lower():val for key,val in COG_creation_options.items() }
     
-    #throw error as these options not been tested and may not work
-    #overview_count is used internally
-    exclude_opts = [opt for opt in ['warp_resampling','target_srs','tiling_scheme','overview_count'] if opt in user_creation_options]
+    #throw error as these options have not been tested and likely wont work as expected
+    exclude_opts = [opt for opt in ['warp_resampling','target_srs','tiling_scheme'] if opt in user_creation_options]
     if exclude_opts:
         raise ValueError (f'ccog cant work with COG_creation_options of {exclude_opts}')
                 
@@ -560,7 +547,7 @@ def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = 
         user_creation_options['overview_resampling'] = user_creation_options['resampling']
         del user_creation_options['resampling']
     
-    #todo: error if required_creation_options are goign to change user_creation_options
+    #todo: error if required_creation_options are going to change user_creation_options
 
     #build the profile from layering profile sources sequentially making sure most important end up with precendence.
     profile = default_creation_options.copy()
@@ -573,15 +560,12 @@ def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = 
         raise ValueError (f'blocksize must be multiples of 256')
 
     #check chunking.
-    chunky_checker(x_arr.data,profile['blocksize'])
+    if any([dim%profile['blocksize'] for dim in x_arr.data.chunks[0][:-1]]) or any([dim%profile['blocksize'] for dim in x_arr.data.chunks[1][:-1]]):
+        raise ValueError ('chunking needs to be multiples of the blocksize (except the last in any dimension)')
+
     
     #building the delayed graph
     mpu_store = dask.delayed(aws_tools.Mpu)(store,storage_options=storage_options)
-    parts_info = nested_graph_builder(x_arr.data,mpu_store,profile=profile,rasterio_env_options=rasterio_env_options)
-
-    #empty_single_band_COG is slow for large COGs
-    #if its not part of write_tiff_header it runs concurrently with other jobs.
-    header_bytes = dask.delayed(empty_single_band_COG)(profile, rasterio_env_options= rasterio_env_options)
-    delayed_graph = dask.delayed(write_tiff_header)(mpu_store, header_bytes, parts_info)
+    delayed_graph = COG_graph_builder(x_arr.data,mpu_store,profile=profile,rasterio_env_options=rasterio_env_options)
     return delayed_graph
 
