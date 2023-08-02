@@ -37,9 +37,9 @@ required_creation_options = dict(
     sparse_ok=True,
     driver="COG",
     bigtiff="YES",
-    num_threads="all_cpus", #TODO: tet what difference this makes if any on a dask cluster
+    num_threads="all_cpus", #TODO: test what difference this makes if any on a dask cluster
     overviews="AUTO",
-    JPEGTABLESMODE = 0, #not tested but will be needed when I get to multiband compressed data- does it work with the GDAL COG driver? 
+    jpegtablesmode = 0, #not tested but will be needed when I get to multiband compressed data- does it work with the GDAL COG driver? 
 )
 
 default_creation_options = dict(
@@ -249,7 +249,7 @@ def partial_COG_maker(
     
     # data will be more flexible later as 2d numpy arrays
     tile_col_count = math.ceil(page.imagewidth/page.tilewidth)
-    part_bytes = np.array(part_bytes,dtype=object).reshape(tile_col_count,-1)
+    #part_bytes = np.array(part_bytes,dtype=object).reshape(tile_col_count,-1) #not currently needed - leave as may be useful if rearranging tiles in a later step in the future
 
     #not convinced this is the correct place to produce this data - could easily be made from the part_bytes in a later step
     #eg use np.vectorize(len)(part_bytes) to generate databytecounts
@@ -273,98 +273,13 @@ def adjust_compression(profile):
     for k1,k2 in [('overview_compress','compress'),('overview_quality','quality'),('overview_predictor','predictor'),]:
         if k1 in profile:
             profile[k2] = profile[k1]
-            
-def mpu_write_planner(buffer_parts,part_bytes,end_partition=False,merge_partition=None,end_final_partition = False):
+
+def COG_graph_builder(da,store,profile,rasterio_env_options,storage_options=None):
     '''
-        the main place for the logic for handling partitioned writes to ranges of a mpu
-        
-    '''
-    
-    #NOT FINISHED
-    
-    
-    
-    #partitions hold the first write back so enable the previous partiation to make a write if it doesnt get over the 5MiB limit.
-    #this is unavoidable unless its ok to add padding into the file at the end of a partition.
-    #this is also easier then keeping a 5MiB buffer active while writing a partitation and (and such a buffer doesnt work if there is 
-    #a partition with less then 5MiB of data to write.
-    
-    #TODO: revisit thinking about memory usage as the data buffer might be many GB and avoiding duplicating this much data is worthwhile
-    #TODO: if thinking about a row major or z order for the stored tiles this could be where it would be done.
-    #TODO: may want to trigger the first write to have an upper limit at smaller size to avoid having to keep a first data part that is say 4GiB in memory when 5MiB will do
-    #todo: ensure user limit bytes is in the valid s3 range
-    #TODO: the below logic works but its asthetically clunky. revisit with fresh eyes
-    
-    #2GiB #TODO: make user setable.
-    user_limit_bytes = 2 * 1024 * 1024 * 1024
-
-    partition_start_id,partition_end_id,next_id,queue = buffer_parts
-    
-    part_bytes = [item for item in part_bytes if item is not None]
-    queue.extend(part_bytes)
-    current_length = 0
-    current_queue = deque()
-    
-    first_write = None
-    writes = []
-    
-    while queue:
-        b = queue.popleft()
-        current_length += len(b)
-        current_queue.append(b)
-        if current_length < s3_min_part_bytes:
-            continue
-        if next_id == partition_start_id and partition_start_id != 1:
-            #first lot of data in the partition (but not the first partition) need to keep a small amount for joining partitions
-            joined_buffer = b''.join(current_queue)
-            current_queue.clear()
-            current_length = 0
-            #deal with if the data is too long (happens if a very large object is in the buffer)
-            #first write needs to have space for a small write from the previous partition if needed
-            if current_length > (s3_max_part_bytes - s3_min_part_bytes):
-                #do something to split up the data
-                #generally want to avoid spliting the chunks of data that come in but unavoidable due to large part and s3_max_part_bytes
-                queue.appendleft(joined_buffer[s3_min_part_bytes:])
-                joined_buffer = joined_buffer[:s3_min_part_bytes]
-            #store the first write
-            first_write = [joined_buffer]
-            next_id += 1
-
-        elif current_length > user_limit_bytes:
-            joined_buffer = b''.join(current_queue)
-            if current_length > s3_max_part_bytes:
-                if (current_length - len(b)) >= s3_min_part_bytes:
-                    #put the last one back
-                    queue.appendleft(current_queue.pop())
-                    joined_buffer = b''.join(current_queue)
-                else:
-                    #cant put the last one back
-                    #generally want to avoid spliting the chunks of data that come in but unavoidable due to large part and s3_max_part_bytes
-                    joined_buffer = b''.join(current_queue)
-                    queue.appendleft(joined_buffer[user_limit_bytes:])
-                    joined_buffer = joined_buffer[:user_limit_bytes]
-                
-            current_queue.clear()
-            current_length = 0
-            writes.append ([next_id,joined_buffer])
-            assert next_id <= partition_end_id, f'too many parts written in partition {partition_start_id} to {partition_end_id}'
-            next_id += 1
-            
-
-    
-    buffer_parts = [partition_start_id,partition_end_id,next_id,current_queue]
-    return first_write,writes,buffer_parts
-
-
-def COG_graph_builder(da,mpu_store,profile,rasterio_env_options):
-    '''
+    makes a dask delayed graph that when computed writes a COG file to S3
     '''
     tif_part_maker_func = dask.delayed(partial_COG_maker, nout=3)
-    mpu_write_planner_func = dask.delayed(mpu_write_planner, nout=3)
-    mpu_writer_func = dask.delayed(mpu_store.upload_parts_mpu, nout=1)
-    mpu_complete_func = dask.delayed(mpu_store.complete_mpu)
-    resolve_partition_boundaries_func = dask.delayed(resolve_partition_boundaries,nout=)
-    
+
     #ensure the overview count is set
     profile['overview_count'] = get_maximum_overview_level(profile['width'], profile['height'], minsize=profile['blocksize'],overview_count=profile.get('overview_count',None))
     profile = profile.copy()
@@ -382,14 +297,14 @@ def COG_graph_builder(da,mpu_store,profile,rasterio_env_options):
         parts_info[level] = []
         parts_bytes[level] = []
         chunk_heights, chunk_widths = da.chunks
-        da_del = da.to_delayed(optimize_graph=False)
+        da_del = da.to_delayed(optimize_graph=True)
         res_arr = np.ndarray(da_del.shape, dtype=object)
 
         for blk in da_del.ravel():
             ind = blk.key[1:]
-            overview_arr,part_bytes,part_info = tif_part_maker_func(blk,current_level_profile,del_rasterio_env_options)
+            overview_arr,part_bytes,part_info = tif_part_maker_func(blk,current_level_profile,del_rasterio_env_options,)
             parts_info[level].append((ind,part_info))
-            parts_bytes[level].append((ind,part_bytes))
+            parts_bytes[level].append(part_bytes) #((ind,part_bytes))
             blk_final_shape = (chunk_heights[ind[0]] // 2,chunk_widths[ind[1]] // 2)
             res_arr[ind] = dask.array.from_delayed(overview_arr, shape=blk_final_shape, dtype=da.dtype)
 
@@ -422,37 +337,8 @@ def COG_graph_builder(da,mpu_store,profile,rasterio_env_options):
     partition_specs['header']['data']=[header_bytes_final]
     for level in sorted(parts_bytes, reverse=True):#revese so that when levels share a partition they need to be in this order
         partition_specs.get('level',partition_specs['last_overviews'])['data'].extend(parts_bytes[level])
-        
-    #now deal with the writing to mpu
-    mpu_parts = []
-    previous_buffer_parts = None
-    for partition in partition_specs.values():
-        first_parts = []
-        buffer_parts = [partition['start'],partition['end'],partition['start'],deque(),]
-        for parts_bytes in partition['data']:
-            first_part,write_parts,buffer_parts = mpu_write_planner_func(buffer_parts,parts_bytes)
-            first_parts.append(first_part)
-            mpu_parts.append(mpu_writer_func(write_parts))
-        #empty the buffer if possible
-        first_part,write_parts,buffer_parts = mpu_write_planner_func(buffer_parts,end_partition = True)
-        first_parts.append(first_part)
-        mpu_parts.append(mpu_writer_func(write_parts))
-        
-        partition['first_parts'] = first_parts
-        partition['buffer_parts'] = buffer_parts 
     
-        if previous_buffer_parts is not None:
-            first_part,write_parts,buffer_parts = mpu_write_planner_func(previous_buffer_parts,first_parts,merge_partition = buffer_parts)
-            first_parts.append(first_part)
-            mpu_parts.append(mpu_writer_func(write_parts))
-        previous_buffer_parts = buffer_parts
-        
-    #write the final mpu
-    first_part,write_parts,buffer_parts = mpu_write_planner_func(buffer_parts,end_final_partition = True)
-    first_parts.append(first_part)
-    mpu_parts.append(mpu_writer_func(write_parts))
-    
-    delayed_graph = mpu_complete_func(mpu_parts)
+    delayed_graph = mpu_upload_dask_partitioned(partition_specs.values(),store,storage_options=storage_options)
     return delayed_graph
 
 def ifd_updater(memfile,block_data):
@@ -547,7 +433,7 @@ def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = 
         user_creation_options['overview_resampling'] = user_creation_options['resampling']
         del user_creation_options['resampling']
     
-    #todo: error if required_creation_options are going to change user_creation_options
+    #todo: raise error if required_creation_options are going to change user_creation_options
 
     #build the profile from layering profile sources sequentially making sure most important end up with precendence.
     profile = default_creation_options.copy()
@@ -555,17 +441,15 @@ def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = 
     profile.update(user_creation_options)
     profile.update(required_creation_options)
     
-    if int(profile['blocksize']) % 256: 
-        #really the tiff rule is 16 but that is a very small block
-        raise ValueError (f'blocksize must be multiples of 256')
+    if int(profile['blocksize']) % 16: 
+        #the tiff rule is 16 but that is a very small block, resulting in a large header. consider a 256 minimum?
+        raise ValueError (f'blocksize must be multiples of 16')
 
     #check chunking.
     if any([dim%profile['blocksize'] for dim in x_arr.data.chunks[0][:-1]]) or any([dim%profile['blocksize'] for dim in x_arr.data.chunks[1][:-1]]):
         raise ValueError ('chunking needs to be multiples of the blocksize (except the last in any dimension)')
 
-    
     #building the delayed graph
-    mpu_store = dask.delayed(aws_tools.Mpu)(store,storage_options=storage_options)
-    delayed_graph = COG_graph_builder(x_arr.data,mpu_store,profile=profile,rasterio_env_options=rasterio_env_options)
+    delayed_graph = COG_graph_builder(x_arr.data,store,profile=profile,rasterio_env_options=rasterio_env_options,storage_options=storage_options)
     return delayed_graph
 
