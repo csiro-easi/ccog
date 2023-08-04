@@ -39,7 +39,12 @@ required_creation_options = dict(
     bigtiff="YES",
     num_threads="all_cpus", #TODO: test what difference this makes if any on a dask cluster
     overviews="AUTO",
-    jpegtablesmode = 0, #not tested but will be needed when I get to multiband compressed data- does it work with the GDAL COG driver? 
+    jpegtablesmode = 0, # will be needed when I get to multiband compressed data- doesnt work with the GDAL COG driver
+    
+    #the COG driver ignores a number of options including JPEGTABLESMODE,NBITS,INTERLEAVE
+    # Why does GDAL do this. as far as i can tell the COG driver requires a geotiff to be written first and then the cog is a copy from that
+    #TODO: JPEGTABLESMODE will be needed - will either need GDAl to make a change or CCOG to use the geotiff driver for some situations
+
 )
 
 default_creation_options = dict(
@@ -58,8 +63,6 @@ def get_maximum_overview_level(width, height, minsize=256,overview_count=None):
     modified to match the behaviour of the gdal COG driver
     so that the smallest overview is smaller than `minsize` in BOTH width and height.
     
-    modified to have different behaviour to rasterio and GDAL
-    wont produce more overview levels once one dimension has reduced to 1 pixel.
     Attributes
     ----------
     width : int
@@ -77,17 +80,17 @@ def get_maximum_overview_level(width, height, minsize=256,overview_count=None):
     
     #GDAL will keep producing overviews for single pixel strands of data longer then blocksize.
     #this is a bit odd because the resampling doesnt make sense
-    #here limit overviews when min dimension is 1.
+
 
     overview_level = 0
     overview_factor = 1
     if overview_count is not None:
-        while overview_count > overview_level and min(width // overview_factor, height // overview_factor) > 1:
+        while overview_count > overview_level and max(width // overview_factor, height // overview_factor) > 1:
             overview_factor *= 2
             overview_level += 1 
-            print (width // overview_factor, height // overview_factor)
+            #print (width // overview_factor, height // overview_factor)
     else:
-        while max(width // overview_factor, height // overview_factor) > minsize and min(width // overview_factor, height // overview_factor) > 1:
+        while max(width // overview_factor, height // overview_factor) > minsize:
             overview_factor *= 2
             overview_level += 1
 
@@ -178,7 +181,6 @@ def empty_single_band_COG(profile,rasterio_env_options=None):
 
     with rasterio.Env(**rasterio_env_options):
         with rasterio.io.MemoryFile() as memfile:
-            memfile = rasterio.io.MemoryFile()
             rasterio.shutil.copy(
                 vrt,
                 memfile.name,
@@ -218,21 +220,22 @@ def partial_COG_maker(
     #not using the transform in profile as its going to be wrong - make it obviously wrong avoids rasterio warnings
     profile['transform']= Affine.scale(2)
     #the overview is only used for resampling its not stored
-    profile["overview_count"] = 1
     profile["overview_compress"] = 'NONE'
-    
-    print (profile)
-    shp = arr.shape
+    profile["overview_count"] = 1
+    overview_arr = None
+    if profile['height']==1 and profile['width']==1:
+        #stops gdal throwing an error
+        #in the case of a 1x1 pixel input return it as the overview
+        profile["overview_count"] = 0
+        overview_arr = arr
+        
     with rasterio.Env(**rasterio_env_options):
         with rasterio.io.MemoryFile() as memfile:
             with memfile.open(**profile) as src:
                 src.write(arr, 1)
                 del arr  # reducing mem footprint
             
-            #need to stop gdal producing overviews that should shrink to nothing.
-            #however note that GDAL wont do this for a whole image so there is an edge case inconsistency here
-            overview_arr = None
-            if min(shp)>1:
+            if profile["overview_count"]:
                 with memfile.open(overview_level=0) as src:
                     # get the required overview back as an array
                     overview_arr = src.read(1)
@@ -278,6 +281,7 @@ def COG_graph_builder(da,store,profile,rasterio_env_options,storage_options=None
     '''
     makes a dask delayed graph that when computed writes a COG file to S3
     '''
+    
     tif_part_maker_func = dask.delayed(partial_COG_maker, nout=3)
 
     #ensure the overview count is set
@@ -297,16 +301,28 @@ def COG_graph_builder(da,store,profile,rasterio_env_options,storage_options=None
         parts_info[level] = []
         parts_bytes[level] = []
         chunk_heights, chunk_widths = da.chunks
+        #matching gdal behaviour
+        if len(chunk_heights)>1 and chunk_heights[-1] ==1:
+            chunk_heights = chunk_heights[:-1]
+        if len(chunk_widths)>1 and chunk_widths[-1] ==1:
+            chunk_widths = chunk_widths[:-1]
+        
+        #this is the slowest line by far. if not optimize_graph its faster but slower overall.
+        #i think i recall in earlier testing that dask was making some bad choices about rerunning slow code with optimize_graph=True - check/test
         da_del = da.to_delayed(optimize_graph=True)
-        res_arr = np.ndarray(da_del.shape, dtype=object)
+        res_arr = np.ndarray((len(chunk_heights),len(chunk_widths)), dtype=object)
 
         for blk in da_del.ravel():
             ind = blk.key[1:]
             overview_arr,part_bytes,part_info = tif_part_maker_func(blk,current_level_profile,del_rasterio_env_options,)
             parts_info[level].append((ind,part_info))
             parts_bytes[level].append(part_bytes) #((ind,part_bytes))
-            blk_final_shape = (chunk_heights[ind[0]] // 2,chunk_widths[ind[1]] // 2)
-            res_arr[ind] = dask.array.from_delayed(overview_arr, shape=blk_final_shape, dtype=da.dtype)
+            
+            #checks if the index falls within the array
+            #throwing away overviews that are an artifact of the way gdal produces overviews when there is a dimension of 1
+            if len([1 for s,i in zip(res_arr.shape,ind) if i<s])==2:
+                blk_final_shape = (max(1,chunk_heights[ind[0]] // 2),max(1,chunk_widths[ind[1]] // 2))
+                res_arr[ind] = dask.array.from_delayed(overview_arr, shape=blk_final_shape, dtype=da.dtype)
 
         #if level == profile['overview_count']: #last
         #    break
@@ -338,7 +354,8 @@ def COG_graph_builder(da,store,profile,rasterio_env_options,storage_options=None
     for level in sorted(parts_bytes, reverse=True):#revese so that when levels share a partition they need to be in this order
         partition_specs.get('level',partition_specs['last_overviews'])['data'].extend(parts_bytes[level])
     
-    delayed_graph = mpu_upload_dask_partitioned(partition_specs.values(),store,storage_options=storage_options)
+    #return partition_specs
+    delayed_graph = aws_tools.mpu_upload_dask_partitioned(partition_specs.values(),store,storage_options=storage_options)
     return delayed_graph
 
 def ifd_updater(memfile,block_data):
@@ -402,6 +419,7 @@ def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = 
     COG_creation_options (dict, optional) – options as described here https://gdal.org/drivers/raster/cog.html#creation-options
         unlike gdal resampling defaults to nearest unless specified
         not all creation options are available at this stage.
+    
     rasterio_env_options (dict, optional) –  options as described here https://rasterio.readthedocs.io/en/latest/topics/image_options.html#configuration-options
         gdal exposes many configuration options how (or if) any particular option works with ccog is untested
         ccog does all its work in memory so many of the commonly used gdal config options are unlikely to be useful, but the option is there if you want to try.
@@ -409,6 +427,11 @@ def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = 
     
     returns a dask.delayed object
     '''
+    #todo:
+    #In addition to the gdal option an optional colormap is accepted. This only works with a single int8 band.
+    #eg colormap = {0:(4,0,0,4),255:(0,0,4,4)}
+    #for more info see https://rasterio.readthedocs.io/en/stable/topics/color.html
+    
     #TODO: shortcut route if a small array can just be handled as a single part
     #TODO: work with GDAL config settings (environment)
     
