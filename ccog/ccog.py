@@ -110,7 +110,7 @@ def xarray_to_profile(x_arr):
     )
     return profile
 
-def empty_single_band_COG(profile,rasterio_env_options=None,mask=False):
+def empty_COG(profile,rasterio_env_options=None,mask=False):
     """
     makes an empty sparse COG in memory
 
@@ -323,8 +323,8 @@ def COG_graph_builder(da,store,profile,rasterio_env_options,storage_options=None
         da = da.rechunk(chunks= (chunk_heights[0], chunk_widths[0]))
         current_level_profile = del_overview_profile
 
-    #empty_single_band_COG is slow for large COGs, its seperate here so dask can run it early
-    header_bytes = dask.delayed(empty_single_band_COG)(del_profile, rasterio_env_options= del_rasterio_env_options)
+    #empty_COG is slow for large COGs, its seperate here so dask can run it early
+    header_bytes = dask.delayed(empty_COG)(del_profile, rasterio_env_options= del_rasterio_env_options)
     header_bytes_final = dask.delayed(prep_tiff_header)(header_bytes, parts_info)
            
     #set how many mpu parts are used in each partition. 
