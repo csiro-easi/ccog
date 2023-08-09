@@ -153,16 +153,21 @@ class Mpu:
         """
         if self.finalised:
             return
-        #make sure parts are sorted and filter out any skipped parts
-        mpu_parts = [part for part in mpu_parts if part is not None]
-        mpu_parts = sorted(mpu_parts, key= lambda y: y["PartNumber"]) 
+        #flatten and make sure parts are sorted and filter out any skipped parts
+        parts = []
+        for part in mpu_parts:
+            if isinstance(part, list):
+                parts.extend(part)
+            elif part is not None:
+                parts.append(part)
+        parts = sorted(parts, key= lambda y: y["PartNumber"]) 
         try:
             _ = self.store.fs.call_s3(
                 "complete_multipart_upload",
                 Bucket=self.mpu["Bucket"],
                 Key=self.mpu["Key"],
                 UploadId=self.mpu["UploadId"],
-                MultipartUpload={"Parts": mpu_parts},
+                MultipartUpload={"Parts": parts},
             )
         except:
             print("multipart upload failed")
@@ -176,7 +181,7 @@ class Mpu:
         self.finalised = True
 
         
-def mpu_write_planner(buffer_parts,part_bytes,end_partition=False,merge_partition_buffer=None,end_final_partition = False,user_limit_bytes = 2 * 1024 * 1024 * 1024):
+def mpu_write_planner(buffer_parts,part_bytes=None,end_partition=False,merge_partition_buffer=None,end_final_partition = False,user_limit_bytes = 2 * 1024 * 1024 * 1024):
     '''
         the main place for the logic for handling partitioned writes to ranges of a mpu
         
@@ -198,6 +203,9 @@ def mpu_write_planner(buffer_parts,part_bytes,end_partition=False,merge_partitio
     #trigger the first write to have an upper limit at smaller size to avoid having to keep a first data part that is say 4GiB in memory when 5MiB will do
     #shouldnt usually hit this limit unless there is a large byte string near the start
     #100MiB - max it could be set at is (s3_max_part_bytes - s3_min_part_bytes)
+    #print ('start')
+    part_bytes = [] if part_bytes is None else part_bytes   
+    
     first_buffer_max = 100*1024*1024 
 
     partition_start_id,partition_end_id,next_id,queue = buffer_parts
@@ -226,6 +234,8 @@ def mpu_write_planner(buffer_parts,part_bytes,end_partition=False,merge_partitio
     
     while queue:
         b = queue.popleft()
+        #print (next_id)
+        #print (b)
         current_length += len(b)
         current_queue.append(b)
         if current_length >= s3_min_part_bytes:
@@ -279,6 +289,7 @@ def mpu_write_planner(buffer_parts,part_bytes,end_partition=False,merge_partitio
         assert len(current_queue) == 0, 'buffer part management issue'
     else:
         buffer_parts = [partition_start_id,partition_end_id,next_id,current_queue]
+    #print ('end')
     return first_write,writes,buffer_parts
 
 def mpu_upload_dask_partitioned(partitions,store,storage_options=None):

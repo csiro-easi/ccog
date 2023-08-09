@@ -1,7 +1,7 @@
 __all__ = ['write_ccog']
 
 from contextlib import suppress
-from itertools import count
+from itertools import zip_longest
 from collections import deque
 import math
 import io
@@ -151,9 +151,13 @@ def empty_COG(profile,rasterio_env_options=None,mask=False):
                 memfileio.truncate(valueoffset)        
                 h = profile['height']
                 w = profile['width']
-                for main_and_mask in zip(main,mask):
+                for main_and_mask in zip_longest(main,mask):
                     num_tiles = math.ceil(h/profile["blocksize"])*math.ceil(w/profile["blocksize"])
                     for p in main_and_mask:
+                        #interleaving the main and mask offsets/bytecounts
+                        if p is None:
+                            #no mask
+                            continue
                         #tifffile gave warnings if editing offsets and bytes at once. so opening and closing the files
                         memfileio.seek(0)
                         with tifffile.TiffFile(memfileio) as tif:
@@ -332,7 +336,7 @@ def COG_graph_builder(da,store,profile,rasterio_env_options,storage_options=None
                        }
                         
     #rearrange the delayed data into the write partitions
-    partition_specs['header']['data']=[header_bytes_final]
+    partition_specs['header']['data']=[[header_bytes_final,],]
     for level in sorted(parts_bytes, reverse=True):#revese so that when levels share a partition they need to be in this order
         partition_specs.get('level',partition_specs['last_overviews'])['data'].extend(parts_bytes[level])
     
@@ -346,6 +350,7 @@ def ifd_updater(memfile,block_data):
     block_offsets,block_counts = block_data
     with tifffile.TiffFile(memfile) as tif:
         for page,offs,cnts in zip(tif.pages,block_offsets,block_counts):
+            #print (page.tags)
             assert len(page.tags['TileOffsets'].value) == len(offs) == len(cnts), 'oh no data is muddled'
             page.tags['TileOffsets'].overwrite(offs)
             page.tags['TileByteCounts'].overwrite(cnts)
@@ -375,16 +380,21 @@ def ifd_offset_adjustments(header_length,parts_info):
         block_offsets.append(np.block(TileOffsets_arr.tolist()).ravel())
         block_counts.append(np.block(TileByteCounts_arr.tolist()).ravel())
 
-    return (block_offsets, block_counts)
+    #reverse as the header pages are in reverse order
+    return (block_offsets[::-1], block_counts[::-1])
                               
 def prep_tiff_header(header_bytes,parts_info):
     '''update the header
     '''                             
     #adjust the block data
+    #print (parts_info)
     block_data = ifd_offset_adjustments(len(header_bytes),parts_info)
+    #print ('................')
+    #print (block_data)
     #write the block data into the header
     with io.BytesIO(header_bytes) as memfile:
         ifd_updater(memfile,block_data)
+        memfile.seek(0)
         header_data = memfile.getvalue()
     return header_data
     
@@ -450,8 +460,10 @@ def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = 
         raise ValueError (f'blocksize must be multiples of 16')
 
     #check chunking.
-    if any([dim%profile['blocksize'] for dim in x_arr.data.chunks[0][:-1]]) or any([dim%profile['blocksize'] for dim in x_arr.data.chunks[1][:-1]]):
-        raise ValueError ('chunking needs to be multiples of the blocksize (except the last in any dimension)')
+    if any([dim%profile['blocksize'] for dim in x_arr.data.chunks[-2][:-1]]) or any([dim%profile['blocksize'] for dim in x_arr.data.chunks[-1][:-1]]):
+        raise ValueError ('chunking needs to be multiples of the blocksize (except the last in any spatial dimension)')
+    if len(x_arr.data.chunks) ==3 and len(x_arr.data.chunks[0]) > 1:
+        raise ValueError ('non spatial dimension chunking needs to be a single chunk')
 
     #building the delayed graph
     delayed_graph = COG_graph_builder(x_arr.data,store,profile=profile,rasterio_env_options=rasterio_env_options,storage_options=storage_options)
