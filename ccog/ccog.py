@@ -41,7 +41,7 @@ required_creation_options = dict(
     overviews="AUTO",
     jpegtablesmode = 0, # will be needed when I get to multiband compressed data- doesnt work with the GDAL COG driver
     
-    #the COG driver ignores a number of options including JPEGTABLESMODE,NBITS,INTERLEAVE
+    #the COG driver ignores a number of options including JPEGTABLESMODE
     # Why does GDAL do this. as far as i can tell the COG driver requires a geotiff to be written first and then the cog is a copy from that
     #TODO: JPEGTABLESMODE will be needed - will either need GDAl to make a change or CCOG to use the geotiff driver for some situations
 
@@ -51,6 +51,7 @@ default_creation_options = dict(
     geotiff_version= 1.1, #why not use the latest by default
     blocksize = 512,
     overview_resampling = rasterio.enums.Resampling.nearest,
+    COG_ghost_data = False,
 
 )
 
@@ -109,62 +110,7 @@ def xarray_to_profile(x_arr):
     )
     return profile
 
-def empty_single_band_vrt(**profile):
-    """Make a VRT XML document.
-
-    This is a very simple vrt with no datasets.
-
-    Its used as a starting point to create an empty COG file
-
-    Parameters
-    ----------
-    Returns
-    -------
-    str
-        An XML text string.
-    """
-    #         Implementation notes:
-    #     A COG can only be created with the gdal COG driver by copying an existing dataset
-    #     Note that rasterio seems to hide this in the background but also seems to 
-    #     break the handling of nodata in sparse COGs if you never write to them.
-    #     The method used here is also faster than getting rasterio to produce an empty COG from scratch.
-
-    #     The existing dataset doesnt need to be a VRT but experimentation has shown that this VRT
-    #     is faster then the other empty datasets Ive tried as starting points.
-    #     Of particular benefit is the inclusion of an OverviewList
-    #     It seems that building overviews, even if empty and sparse is the slow part of making a COG.
-
-    #     An alternative approach to produce the vrt xml written in this code
-    #     is to use a dummy dataset and BuildVRT and then
-    #     build_overviews with VRT_VIRTUAL_OVERVIEWS = 'YES'and then editing the VRT to remove the dummy dataset
-    #     The code below produces an output identical to the above steps but this implementation 
-    #     is prefered as it is more direct and hopefully clearer
-    
-    overviews = " ".join([str(2**j) for j in range(1, profile['overview_count'] + 1)])
-    
-    # based on code in rasterio https://github.com/rasterio/rasterio/blob/main/rasterio/vrt.py
-    vrtdataset = ET.Element("VRTDataset")
-    vrtdataset.attrib["rasterXSize"] = str(profile['width'])
-    vrtdataset.attrib["rasterYSize"] = str(profile['height'])
-    srs = ET.SubElement(vrtdataset, "SRS")
-    srs.text = profile['crs'].wkt if 'crs' in profile else ""
-    geotransform = ET.SubElement(vrtdataset, "GeoTransform")
-    geotransform.text = ",".join([str(v) for v in profile['transform'].to_gdal()])
-    
-    vrtrasterband = ET.SubElement(vrtdataset, "VRTRasterBand")
-    vrtrasterband.attrib["dataType"] = rasterio.dtypes._gdal_typename(profile['dtype'])
-    vrtrasterband.attrib["band"] = str(1)
-    vrtrasterband.attrib["blockXSize"] = str(profile['blocksize'])
-    vrtrasterband.attrib["blockYSize"] = str(profile['blocksize'])
-    if 'nodata' in profile:
-        nodatavalue = ET.SubElement(vrtrasterband, "NoDataValue")
-        nodatavalue.text = str(profile['nodata'])
-    OverviewList = ET.SubElement(vrtdataset, "OverviewList")
-    OverviewList.attrib["resampling"] = profile['overview_resampling'].name.upper()
-    OverviewList.text = overviews
-    return ET.tostring(vrtdataset).decode("ascii")
-
-def empty_single_band_COG(profile,rasterio_env_options=None):
+def empty_single_band_COG(profile,rasterio_env_options=None,mask=False):
     """
     makes an empty sparse COG in memory
 
@@ -173,22 +119,68 @@ def empty_single_band_COG(profile,rasterio_env_options=None):
 
     returns bytes
     """
+    #This simply works by calling gdal with rasterio and not writing any data
+    #however for large datasets this can be quite slow.
+    #so the size of the dataset is reduced so that it still creates all the required overview
+    #then tifffile is used to massage the file to the correct dimensions.
+
     rasterio_env_options = {} if rasterio_env_options is None else rasterio_env_options
     #this is applied elsewhere but apply here for when testing
     profile.update(required_creation_options)
-       
-    vrt = empty_single_band_vrt(**profile)
 
+    dim = max([profile['height'],profile['width']])
+    prof = profile.copy()
+    prof['height'] = dim
+    prof['width'] = 1
     with rasterio.Env(**rasterio_env_options):
         with rasterio.io.MemoryFile() as memfile:
-            rasterio.shutil.copy(
-                vrt,
-                memfile.name,
-                **profile
-            )
+            with memfile.open(**prof) as src:
+                if "colormap" in profile:
+                    src.write_colormap(1, profile["colormap"])
+                if mask == True:
+                    src.write_mask(False)
+                #todo include tags,scale,offset,desctription,units etc
+                #todo handle jpegtables 0
             memfile.seek(0)
             data = memfile.read()
-    return data
+
+            with io.BytesIO(data) as memfileio:
+                with tifffile.TiffFile(memfileio) as tif:
+                    valueoffset = tif.pages[0].tags['TileOffsets'].valueoffset
+                    main = []
+                    mask=[]
+                    for p in tif.pages:
+                        tif.pages[p.index].tags['ImageWidth'].overwrite(1)
+                        tif.pages[p.index].tags['ImageLength'].overwrite(1)
+                        tif.pages[p.index].tags['TileByteCounts'].overwrite([0])
+                        tif.pages[p.index].tags['TileOffsets'].overwrite([0])
+                        if 'MASK' in str(p.tags.get('NewSubfileType','')):
+                            mask.append(p)
+                        else:
+                            main.append(p)
+                memfileio.truncate(valueoffset)        
+                h = profile['height']
+                w = profile['width']
+                for main_and_mask in zip(main,mask):
+                    num_tiles = math.ceil(h/profile["blocksize"])*math.ceil(w/profile["blocksize"])
+                    for p in main_and_mask:
+                        #tifffile gave warnings if editing offsets and bytes at once. so opening and closing the files
+                        memfileio.seek(0)
+                        with tifffile.TiffFile(memfileio) as tif:
+                            tif.pages[p.index].tags['ImageWidth'].overwrite(w,dtype='I',erase=True)
+                            tif.pages[p.index].tags['ImageLength'].overwrite(h,dtype='I',erase=True)
+                            tif.pages[p.index].tags['TileOffsets'].overwrite([0]*num_tiles,erase=True)
+                        memfileio.seek(0)
+                        with tifffile.TiffFile(memfileio) as tif:
+                            tif.pages[p.index].tags['TileByteCounts'].overwrite([0]*num_tiles,erase=True)
+                    h =max(1,h//2)
+                    w =max(1,w//2)
+                memfileio.seek(0)
+                if not profile["COG_ghost_data"]:
+                    delete_COG_ghost_header(memfileio)
+                memfile.seek(0)
+                data_fixed = memfileio.read()
+    return data_fixed
 
 def delete_COG_ghost_header(memfile):
     '''If messing with the gdal COG block order optimisations its likely a good idea to let GDAL know about it in the ghost header
@@ -403,7 +395,6 @@ def prep_tiff_header(header_bytes,parts_info):
     #write the block data into the header
     with io.BytesIO(header_bytes) as memfile:
         ifd_updater(memfile,block_data)
-        delete_COG_ghost_header(memfile)
         header_data = memfile.getvalue()
     return header_data
     
