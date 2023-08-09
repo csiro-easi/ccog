@@ -26,6 +26,17 @@ from osgeo import gdal
 from rasterio._path import _parse_path, _vsi_path
 import dask
 
+# s3 part limit docs https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
+# actually 1 to 10,000 (inclusive) 
+s3_part_limit = 10000  
+# 5 MiB - There is no minimum size limit on the last part of your multipart upload.
+s3_min_part_bytes = 5 * 1024 * 1024  
+# 5 GiB
+s3_max_part_bytes = 5 * 1024 * 1024 * 1024  
+# 5 TiB
+s3_max_total_bytes = 5 * 1024 * 1024 * 1024 * 1024 
+
+
 def _resolve_store(store,storage_options=None):
     '''
     handle stores supplied as strings with storage options

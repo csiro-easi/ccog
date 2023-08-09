@@ -21,17 +21,7 @@ import tifffile
 
 from . import aws_tools
 
-# s3 part limit docs https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
-# actually 1 to 10,000 (inclusive) 
-s3_part_limit = 10000  
-# leaving the first part for the headers
-s3_start_part = 2  
-# 5 MiB - There is no minimum size limit on the last part of your multipart upload.
-s3_min_part_bytes = 5 * 1024 * 1024  
-# 5 GiB
-s3_max_part_bytes = 5 * 1024 * 1024 * 1024  
-# 5 TiB
-s3_max_total_bytes = 5 * 1024 * 1024 * 1024 * 1024 
+
 
 required_creation_options = dict(
     sparse_ok=True,
