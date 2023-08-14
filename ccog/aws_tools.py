@@ -62,7 +62,7 @@ def s3_to_vrt(store,vrtpath= 's3.vrt', expiration=8 * 60 * 60,storage_options = 
     storage_options = {} if storage_options is None else storage_options
     store = _resolve_store(store,storage_options)
     url = store.fs.url(store.root,expiration)
-    #todo: rasterio is currently added vrt building functionality - switch to use that when its ready.
+    #todo: rasterio is currently adding vrt building functionality - switch to use that when its ready.
     ds = gdal.BuildVRT(vrtpath,_vsi_path(_parse_path(url)))
     ds.FlushCache()
     ds = None
@@ -161,6 +161,7 @@ class Mpu:
             elif part is not None:
                 parts.append(part)
         parts = sorted(parts, key= lambda y: y["PartNumber"]) 
+        #print (parts)
         try:
             _ = self.store.fs.call_s3(
                 "complete_multipart_upload",
@@ -181,7 +182,7 @@ class Mpu:
         self.finalised = True
 
         
-def mpu_write_planner(buffer_parts,part_bytes=None,end_partition=False,merge_partition_buffer=None,end_final_partition = False,user_limit_bytes = 2 * 1024 * 1024 * 1024):
+def mpu_write_planner(buffer_parts,part_bytes=None,end_partition=False,merge_partition_buffer=None,end_final_partition = False,user_limit_bytes = 2 * 1024 * 1024 * 1024,c=0):
     '''
         the main place for the logic for handling partitioned writes to ranges of a mpu
         
@@ -214,16 +215,18 @@ def mpu_write_planner(buffer_parts,part_bytes=None,end_partition=False,merge_par
     part_bytes = [item for item in part_bytes if item is not None]
     queue.extend(part_bytes)
     
-    buffer_merged = False
+    #buffer_merged = False
+    #print (merge_partition_buffer is not None, len(part_bytes))
     if merge_partition_buffer is not None and len(part_bytes) == 0:
-        buffer_merged = True
+        #buffer_merged = True
         #in this case the call is to merge a partition
         #and the second partition didnt have enough bytes to produce a 'first write'
         # can also check merge_partition_buffer[0] == merge_partition_buffer[2] 
         #if this is the case need to merge the 2 buffers
         partition_end_id = merge_partition_buffer[1]
         queue.extend(merge_partition_buffer[3])
-        end_partition = True
+        merge_partition_buffer = None
+        #end_partition = True
     
     
     current_length = 0
@@ -234,12 +237,12 @@ def mpu_write_planner(buffer_parts,part_bytes=None,end_partition=False,merge_par
     
     while queue:
         b = queue.popleft()
-        #print (next_id)
+        #print (next_id, len(b))
         #print (b)
         current_length += len(b)
         current_queue.append(b)
         if current_length >= s3_min_part_bytes:
-            if next_id == partition_start_id and partition_start_id != 1 and not end_partition and not end_final_partition:
+            if next_id == partition_start_id and partition_start_id != 1 and not end_final_partition:
                 #first lot of data in the partition (but not the first partition) need to keep a small amount for joining partitions
                 joined_buffer = b''.join(current_queue)
                 #deal with if the data is too long (happens if a very large object is in the buffer)
@@ -250,7 +253,7 @@ def mpu_write_planner(buffer_parts,part_bytes=None,end_partition=False,merge_par
                     queue.appendleft(joined_buffer[s3_min_part_bytes:])
                     joined_buffer = joined_buffer[:s3_min_part_bytes]
                 #store the first write
-                first_write = [joined_buffer]
+                first_write = joined_buffer
                 current_queue.clear()
                 current_length = 0
                 next_id += 1
@@ -277,20 +280,34 @@ def mpu_write_planner(buffer_parts,part_bytes=None,end_partition=False,merge_par
                 next_id += 1
     
     #all the queue is now in current_queue now and should be shorter then user_limit_bytes
-    if end_final_partition or ( end_partition and current_length >= s3_min_part_bytes):
+    if end_final_partition or merge_partition_buffer is not None: # or ( end_partition and current_length >= s3_min_part_bytes): #should be able some more writing here for the end of a partition- removing for now as logic wasnt correctly acounting for first_writes.
         joined_buffer = b''.join(current_queue)
         writes.append ([next_id,joined_buffer])
         current_queue.clear()
         current_length = 0
         next_id += 1
-    
-    if not buffer_merged and merge_partition_buffer is not None:
+        
+    #if not buffer_merged and 
+    if merge_partition_buffer is not None:
         buffer_parts = merge_partition_buffer
         assert len(current_queue) == 0, 'buffer part management issue'
     else:
         buffer_parts = [partition_start_id,partition_end_id,next_id,current_queue]
-    #print ('end')
+
+    # print ([('aaa',w,len(d)/1024/1024,) for w,d in writes],
+    #        partition_start_id,
+    #        partition_end_id,
+    #        next_id,
+    #        c,
+    #        end_partition,
+    #        end_final_partition,
+    #        first_write is None,
+    #        len(buffer_parts[3]),
+    #        merge_partition_buffer is None)
+    
     return first_write,writes,buffer_parts
+
+from itertools import count
 
 def mpu_upload_dask_partitioned(partitions,store,storage_options=None):
     '''
@@ -316,8 +333,9 @@ def mpu_upload_dask_partitioned(partitions,store,storage_options=None):
     dd.visualize(optimize_graph=True)
     
     '''
-    #TODO: ensure partitions are provided sorted first to last ( or sort them)
+    c = count()
     
+    #TODO: ensure partitions are provided sorted first to last ( or sort them)
     storage_options = {} if storage_options is None else storage_options
     mpu_store = dask.delayed(Mpu)(store,storage_options=storage_options)
     
@@ -332,8 +350,9 @@ def mpu_upload_dask_partitioned(partitions,store,storage_options=None):
         first_parts = []
         buffer_parts = [partition['start'],partition['end'],partition['start'],deque(),]
         last_flag = (len(partition['data'])-1) * [False] + [True]
+        #last_flag = (len(partition['data'])) * [False] #write planner logic needs some work for this to function
         for part_bytes,last in zip(partition['data'],last_flag):
-            first_part,write_parts,buffer_parts = mpu_write_planner_func(buffer_parts,part_bytes,end_partition = last)
+            first_part,write_parts,buffer_parts = mpu_write_planner_func(buffer_parts,part_bytes,end_partition = last,c = next(c))
             first_parts.append(first_part)
             mpu_parts.append(mpu_writer_func(write_parts))
         
@@ -341,13 +360,13 @@ def mpu_upload_dask_partitioned(partitions,store,storage_options=None):
         #Note these boundaries are resolved first to last. Other ordering is possible and may reduce caching load
         #however as long as the amount of data cached to deal with the boundares is small its unlikely to be problematic
         if previous_buffer_parts is not None:
-            first_part,write_parts,buffer_parts = mpu_write_planner_func(previous_buffer_parts,first_parts,merge_partition_buffer = buffer_parts)
+            first_part,write_parts,buffer_parts = mpu_write_planner_func(previous_buffer_parts,first_parts,merge_partition_buffer = buffer_parts,c = next(c))
             first_parts.append(first_part) #todo: shouldnt be any first parts here - throw error if there is
             mpu_parts.append(mpu_writer_func(write_parts))
         previous_buffer_parts = buffer_parts
         
     #write the final mpu
-    first_part,write_parts,buffer_parts = mpu_write_planner_func(buffer_parts,end_final_partition = True)
+    first_part,write_parts,buffer_parts = mpu_write_planner_func(buffer_parts,end_final_partition = True,c = next(c))
     #todo: shouldnt be any first parts or buffer_parts here - throw error if there is
     mpu_parts.append(mpu_writer_func(write_parts))
     

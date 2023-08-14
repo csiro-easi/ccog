@@ -144,6 +144,11 @@ def empty_COG(profile,rasterio_env_options=None,mask=False):
                         tif.pages[p.index].tags['ImageLength'].overwrite(1)
                         tif.pages[p.index].tags['TileByteCounts'].overwrite([0])
                         tif.pages[p.index].tags['TileOffsets'].overwrite([0])
+                        
+                        #experimental to see if having an empty jpegtables tag is ignored on reading
+                        #if 'JPEGTables' in p.tags:
+                        #    tif.pages[p.index].tags['JPEGTables'].overwrite(None,erase=True)
+                        
                         if 'MASK' in str(p.tags.get('NewSubfileType','')):
                             mask.append(p)
                         else:
@@ -161,12 +166,12 @@ def empty_COG(profile,rasterio_env_options=None,mask=False):
                         #tifffile gave warnings if editing offsets and bytes at once. so opening and closing the files
                         memfileio.seek(0)
                         with tifffile.TiffFile(memfileio) as tif:
-                            tif.pages[p.index].tags['ImageWidth'].overwrite(w,dtype='I',erase=True)
-                            tif.pages[p.index].tags['ImageLength'].overwrite(h,dtype='I',erase=True)
-                            tif.pages[p.index].tags['TileOffsets'].overwrite([0]*num_tiles,erase=True)
+                            tif.pages[p.index].tags['ImageWidth'].overwrite(w,dtype='I')
+                            tif.pages[p.index].tags['ImageLength'].overwrite(h,dtype='I')
+                            tif.pages[p.index].tags['TileOffsets'].overwrite([0]*num_tiles)
                         memfileio.seek(0)
                         with tifffile.TiffFile(memfileio) as tif:
-                            tif.pages[p.index].tags['TileByteCounts'].overwrite([0]*num_tiles,erase=True)
+                            tif.pages[p.index].tags['TileByteCounts'].overwrite([0]*num_tiles)
                     h =max(1,h//2)
                     w =max(1,w//2)
                 memfileio.seek(0)
@@ -337,8 +342,8 @@ def COG_graph_builder(da,store,profile,rasterio_env_options,storage_options=None
                         
     #rearrange the delayed data into the write partitions
     partition_specs['header']['data']=[[header_bytes_final,],]
-    for level in sorted(parts_bytes, reverse=True):#revese so that when levels share a partition they need to be in this order
-        partition_specs.get('level',partition_specs['last_overviews'])['data'].extend(parts_bytes[level])
+    for level in sorted(parts_bytes, reverse=True):#reverse so that when levels share a partition they need to be in this order
+        partition_specs.get(level,partition_specs['last_overviews'])['data'].extend(parts_bytes[level])
     
     #return partition_specs
     delayed_graph = aws_tools.mpu_upload_dask_partitioned(partition_specs.values(),store,storage_options=storage_options)
