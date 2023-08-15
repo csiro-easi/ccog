@@ -282,7 +282,7 @@ def adjust_compression(profile):
         if k1 in profile:
             profile[k2] = profile[k1]
 
-def COG_graph_builder(da,store,profile,rasterio_env_options,storage_options=None):
+def COG_graph_builder(da,store,profile,rasterio_env_options,storage_options=None,user_limit_bytes=None):
     '''
     makes a dask delayed graph that when computed writes a COG file to S3
     '''
@@ -315,7 +315,6 @@ def COG_graph_builder(da,store,profile,rasterio_env_options,storage_options=None
         #this is the slowest line by far. if not optimize_graph its faster but slower overall.
         #if optimize_graph=True then the graph ends up reading in the source data many times
         #if optimize_graph=False then the data is read more optimally but the building of the graph gets slower.
-        
         da_del = da.to_delayed(optimize_graph=False)
         res_arr = np.ndarray((len(chunk_heights),len(chunk_widths)), dtype=object)
 
@@ -344,17 +343,18 @@ def COG_graph_builder(da,store,profile,rasterio_env_options,storage_options=None
            
     #set how many mpu parts are used in each partition. 
     #these numbers have been determined from an analysis of the relative size of each overview 
+    #parts must sum to 10000 or less
+    #pasrts should generally ahve a length of at least 3 as there may be small writes either side of a partition boundary
     #every overview after 6 goes in 1 partition
-    partition_specs =  {'header':{'start':1,'end':2,'data':[]},
-                        'last_overviews':{'start':2,'end':3,'data':[]},
-                        6:{'start':3,'end':5,'data':[]},
-                        5:{'start':5,'end':12,'data':[]},
-                        4:{'start':12,'end':42,'data':[]},
-                        3:{'start':42,'end':159,'data':[]},
-                        2:{'start':159,'end':627,'data':[]},
-                        1:{'start':627,'end':2502,'data':[]},
-                        0:{'start':2502,'end':10000,'data':[]},
-                       }
+    partition_specs = {'header': {'length': 3, 'data': []},
+                     'last_overviews': {'length': 3, 'data': []},
+                     6: {'length': 3, 'data': []},
+                     5: {'length': 9, 'data': []},
+                     4: {'length': 32, 'data': []},
+                     3: {'length': 119, 'data': []},
+                     2: {'length': 470, 'data': []},
+                     1: {'length': 1875, 'data': []},
+                     0: {'length': 7486, 'data': []}}
                         
     #rearrange the delayed data into the write partitions
     partition_specs['header']['data']=[[header_bytes_final,],]
@@ -362,7 +362,7 @@ def COG_graph_builder(da,store,profile,rasterio_env_options,storage_options=None
         partition_specs.get(level,partition_specs['last_overviews'])['data'].extend(parts_bytes[level])
     
     #return partition_specs
-    delayed_graph = aws_tools.mpu_upload_dask_partitioned(partition_specs.values(),store,storage_options=storage_options)
+    delayed_graph = aws_tools.mpu_upload_dask_partitioned(partition_specs,store,storage_options=storage_options,user_limit_bytes = user_limit_bytes)
     return delayed_graph
 
 def ifd_updater(memfile,block_data):
@@ -419,7 +419,7 @@ def prep_tiff_header(header_bytes,parts_info):
         header_data = memfile.getvalue()
     return header_data
     
-def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = None, storage_options = None):
+def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = None, storage_options = None, user_limit_bytes= None):
     '''writes a concatenated COG to S3
     x_arr an xarray array.
         notes on chunking:
@@ -487,6 +487,6 @@ def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = 
         raise ValueError ('non spatial dimension chunking needs to be a single chunk')
 
     #building the delayed graph
-    delayed_graph = COG_graph_builder(x_arr.data,store,profile=profile,rasterio_env_options=rasterio_env_options,storage_options=storage_options)
+    delayed_graph = COG_graph_builder(x_arr.data,store,profile=profile,rasterio_env_options=rasterio_env_options,storage_options=storage_options, user_limit_bytes=user_limit_bytes)
     return delayed_graph
 
