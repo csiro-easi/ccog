@@ -182,7 +182,7 @@ class Mpu:
         self.finalised = True
 
         
-def mpu_write_planner(buffer_parts,part_bytes=None,end_partition=False,merge_partition_buffer=None,end_final_partition = False,user_limit_bytes = 2 * 1024 * 1024 * 1024,c=0):
+def mpu_write_planner(buffer_parts,part_bytes=None,end_partition=False,merge_partition_buffer=None,end_final_partition = False, user_limit_bytes = None, c=0):
     '''
         the main place for the logic for handling partitioned writes to ranges of a mpu
         
@@ -206,7 +206,7 @@ def mpu_write_planner(buffer_parts,part_bytes=None,end_partition=False,merge_par
     #100MiB - max it could be set at is (s3_max_part_bytes - s3_min_part_bytes)
     #print ('start')
     part_bytes = [] if part_bytes is None else part_bytes   
-    
+    user_limit_bytes = 2 * 1024 * 1024 * 1024 if user_limit_bytes is None else user_limit_bytes
     first_buffer_max = 100*1024*1024 
 
     partition_start_id,partition_end_id,next_id,queue = buffer_parts
@@ -309,7 +309,7 @@ def mpu_write_planner(buffer_parts,part_bytes=None,end_partition=False,merge_par
 
 from itertools import count
 
-def mpu_upload_dask_partitioned(partitions,store,storage_options=None):
+def mpu_upload_dask_partitioned(partitions,store,storage_options=None,user_limit_bytes = None):
     '''
     writes delayed lists of bytes to s3 with a mpu using partitions to allow writes out of order
     
@@ -317,16 +317,16 @@ def mpu_upload_dask_partitioned(partitions,store,storage_options=None):
     Small caches are used at the boundaries of partitions to avoid issues due to the s3 mpu minimum part size.
     
     simplified example 
-    partition_specs =  {'header':{'start':1,'end':2,'data':[dask.delayed([b'',b'',b'']),dask.delayed([b'',b'',b'']),dask.delayed([b'',b'',b'']),]},
-                        'last_overviews':{'start':2,'end':3,'data':[dask.delayed([b'',b'',b'']),dask.delayed([b'',b'',b'']),dask.delayed([b'',b'',b'']),]},
-                        6:{'start':3,'end':5,'data':[dask.delayed([b'',b'',b'']),dask.delayed([b'',b'',b'']),dask.delayed([b'',b'',b'']),]},
-                        5:{'start':5,'end':12,'data':[dask.delayed([b'',b'',b'']),dask.delayed([b'',b'',b'']),dask.delayed([b'',b'',b'']),]},
-                        4:{'start':12,'end':42,'data':[dask.delayed([b'',b'',b'']),dask.delayed([b'',b'',b'']),dask.delayed([b'',b'',b'']),]},
-                        3:{'start':42,'end':159,'data':[dask.delayed([b'',b'',b'']),dask.delayed([b'',b'',b'']),dask.delayed([b'',b'',b'']),]},
-                        2:{'start':159,'end':627,'data':[dask.delayed([b'',b'',b'']),dask.delayed([b'',b'',b'']),dask.delayed([b'',b'',b'']),]},
-                        1:{'start':627,'end':2502,'data':[dask.delayed([b'',b'',b'']),dask.delayed([b'',b'',b'']),dask.delayed([b'',b'',b'']),]},
-                        0:{'start':2502,'end':10000,'data':[dask.delayed([b'',b'',b'']),dask.delayed([b'',b'',b'']),dask.delayed([b'',b'',b'']),]},
-                       }
+    partition_specs = {'header': {'length': 3, 'data': []},
+                     'last_overviews': {'length': 3, 'data': []},
+                     6: {'length': 3, 'data': []},
+                     5: {'length': 9, 'data': []},
+                     4: {'length': 32, 'data': []},
+                     3: {'length': 119, 'data': []},
+                     2: {'length': 470, 'data': []},
+                     1: {'length': 1875, 'data': []},
+                     0: {'length': 7486, 'data': []}}
+                        
     partitions =partition_specs.values()
     dd = ccog.aws_tools.mpu_upload_dask_partitioned(partitions,'s3:\test\test.tif')
     #%lprun -f ccog.aws_tools.mpu_upload_dask_partitioned ccog.aws_tools.mpu_upload_dask_partitioned(partitions,'test')
@@ -334,7 +334,7 @@ def mpu_upload_dask_partitioned(partitions,store,storage_options=None):
     
     '''
     c = count()
-    
+        
     #TODO: ensure partitions are provided sorted first to last ( or sort them)
     storage_options = {} if storage_options is None else storage_options
     mpu_store = dask.delayed(Mpu)(store,storage_options=storage_options)
@@ -343,16 +343,23 @@ def mpu_upload_dask_partitioned(partitions,store,storage_options=None):
     mpu_writer_func = dask.delayed(mpu_store.upload_parts_mpu, nout=1)
     mpu_complete_func = dask.delayed(mpu_store.complete_mpu)
     
+    #annotate partitions with start values
+    start = 1
+    for k,v in partitions.items():
+        partitions[k]['start'] = start
+        start += v['length']
+        partitions[k]['end'] = start -1
+    
     #now deal with the writing to mpu
     mpu_parts = []
     previous_buffer_parts = None
-    for partition in partitions:
+    for partition in partitions.values():
         first_parts = []
         buffer_parts = [partition['start'],partition['end'],partition['start'],deque(),]
         last_flag = (len(partition['data'])-1) * [False] + [True]
         #last_flag = (len(partition['data'])) * [False] #write planner logic needs some work for this to function
         for part_bytes,last in zip(partition['data'],last_flag):
-            first_part,write_parts,buffer_parts = mpu_write_planner_func(buffer_parts,part_bytes,end_partition = last,c = next(c))
+            first_part,write_parts,buffer_parts = mpu_write_planner_func(buffer_parts,part_bytes,end_partition = last, user_limit_bytes=user_limit_bytes, c = next(c))
             first_parts.append(first_part)
             mpu_parts.append(mpu_writer_func(write_parts))
         
@@ -360,13 +367,13 @@ def mpu_upload_dask_partitioned(partitions,store,storage_options=None):
         #Note these boundaries are resolved first to last. Other ordering is possible and may reduce caching load
         #however as long as the amount of data cached to deal with the boundares is small its unlikely to be problematic
         if previous_buffer_parts is not None:
-            first_part,write_parts,buffer_parts = mpu_write_planner_func(previous_buffer_parts,first_parts,merge_partition_buffer = buffer_parts,c = next(c))
+            first_part,write_parts,buffer_parts = mpu_write_planner_func(previous_buffer_parts,first_parts,merge_partition_buffer = buffer_parts, user_limit_bytes=user_limit_bytes, c = next(c))
             first_parts.append(first_part) #todo: shouldnt be any first parts here - throw error if there is
             mpu_parts.append(mpu_writer_func(write_parts))
         previous_buffer_parts = buffer_parts
         
     #write the final mpu
-    first_part,write_parts,buffer_parts = mpu_write_planner_func(buffer_parts,end_final_partition = True,c = next(c))
+    first_part,write_parts,buffer_parts = mpu_write_planner_func(buffer_parts,end_final_partition = True, user_limit_bytes=user_limit_bytes, c = next(c))
     #todo: shouldnt be any first parts or buffer_parts here - throw error if there is
     mpu_parts.append(mpu_writer_func(write_parts))
     
