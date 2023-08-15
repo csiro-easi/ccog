@@ -106,6 +106,8 @@ def empty_COG(profile,rasterio_env_options=None,mask=False):
 
     used as a reference to look at the structure of a COG file
     and as the starting point for some file format fiddling.
+    
+    faster then doing this directly with rasterio
 
     returns bytes
     """
@@ -117,13 +119,16 @@ def empty_COG(profile,rasterio_env_options=None,mask=False):
     rasterio_env_options = {} if rasterio_env_options is None else rasterio_env_options
     #this is applied elsewhere but apply here for when testing
     profile.update(required_creation_options)
-
-    dim = max([profile['height'],profile['width']])
+   
     prof = profile.copy()
-    prof['height'] = dim
+    #if overview count isnt preset use  max([profile['height'],profile['width']])
+    #however note that gdal has an issue that throws an error if dim is over blocksize and overview_count is zero
+    prof['height'] = 2**profile['overview_count']
     prof['width'] = 1
+    
     with rasterio.Env(**rasterio_env_options):
         with rasterio.io.MemoryFile() as memfile:
+            #print (prof)
             with memfile.open(**prof) as src:
                 if "colormap" in profile:
                     src.write_colormap(1, profile["colormap"])
@@ -136,10 +141,17 @@ def empty_COG(profile,rasterio_env_options=None,mask=False):
 
             with io.BytesIO(data) as memfileio:
                 with tifffile.TiffFile(memfileio) as tif:
-                    valueoffset = tif.pages[0].tags['TileOffsets'].valueoffset
                     main = []
                     mask=[]
+                    trash_offsets = []
                     for p in tif.pages:
+                        if p.tags['TileOffsets'].valueoffset > p.tags['TileOffsets'].offset + 12:
+                            trash_offsets.append(p.tags['TileOffsets'].valueoffset)
+                        #adjust for gdal cog ghost leader
+                        trash_offsets.extend(v-4 for v in p.tags['TileOffsets'].value if v != 0)
+                        if p.tags['TileByteCounts'].valueoffset > p.tags['TileByteCounts'].offset + 12:
+                            trash_offsets.append(p.tags['TileByteCounts'].valueoffset)
+                            
                         tif.pages[p.index].tags['ImageWidth'].overwrite(1)
                         tif.pages[p.index].tags['ImageLength'].overwrite(1)
                         tif.pages[p.index].tags['TileByteCounts'].overwrite([0])
@@ -153,7 +165,9 @@ def empty_COG(profile,rasterio_env_options=None,mask=False):
                             mask.append(p)
                         else:
                             main.append(p)
-                memfileio.truncate(valueoffset)        
+                #truncate file to get rid of old offsets and counts data
+                if trash_offsets:
+                    memfileio.truncate(min(trash_offsets))         
                 h = profile['height']
                 w = profile['width']
                 for main_and_mask in zip_longest(main,mask):
@@ -163,7 +177,7 @@ def empty_COG(profile,rasterio_env_options=None,mask=False):
                         if p is None:
                             #no mask
                             continue
-                        #tifffile gave warnings if editing offsets and bytes at once. so opening and closing the files
+                        #tifffile gave warnings if editing offsets and bytes at once. so opening and closing the file to avoid this
                         memfileio.seek(0)
                         with tifffile.TiffFile(memfileio) as tif:
                             tif.pages[p.index].tags['ImageWidth'].overwrite(w,dtype='I')
@@ -242,15 +256,15 @@ def partial_COG_maker(
                 part_bytes.append(memfile.read(bytecount))
     
     # data will be more flexible later as 2d numpy arrays
-    tile_col_count = math.ceil(page.imagewidth/page.tilewidth)
+    tile_dims_count = (math.ceil(page.imagelength/page.tilelength),math.ceil(page.imagewidth/page.tilewidth))
     #part_bytes = np.array(part_bytes,dtype=object).reshape(tile_col_count,-1) #not currently needed - leave as may be useful if rearranging tiles in a later step in the future
 
     #not convinced this is the correct place to produce this data - could easily be made from the part_bytes in a later step
     #eg use np.vectorize(len)(part_bytes) to generate databytecounts
     #this would give flexability for rearranging the data
-    databytecounts = np.array(page.databytecounts,dtype=np.int64).reshape(tile_col_count,-1)
+    databytecounts = np.array(page.databytecounts,dtype=np.int64).reshape(*tile_dims_count)
     #at some later stage sparse tiles (bytecount=0) need to have their offset set to zero before writing.
-    databyteoffsets = np.cumsum([0,*page.databytecounts[0:-1]],dtype=np.int64).reshape(tile_col_count,-1)
+    databyteoffsets = np.cumsum([0,*page.databytecounts[0:-1]],dtype=np.int64).reshape(*tile_dims_count)
     part_info = (databyteoffsets, databytecounts)
     return overview_arr,part_bytes,part_info
 
