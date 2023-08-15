@@ -313,8 +313,10 @@ def COG_graph_builder(da,store,profile,rasterio_env_options,storage_options=None
             chunk_widths = chunk_widths[:-1]
         
         #this is the slowest line by far. if not optimize_graph its faster but slower overall.
-        #i think i recall in earlier testing that dask was making some bad choices about rerunning slow code with optimize_graph=True - check/test
-        da_del = da.to_delayed(optimize_graph=True)
+        #if optimize_graph=True then the graph ends up reading in the source data many times
+        #if optimize_graph=False then the data is read more optimally but the building of the graph gets slower.
+        
+        da_del = da.to_delayed(optimize_graph=False)
         res_arr = np.ndarray((len(chunk_heights),len(chunk_widths)), dtype=object)
 
         for blk in da_del.ravel():
