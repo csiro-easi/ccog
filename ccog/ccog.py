@@ -337,9 +337,7 @@ def COG_graph_builder(da,store,profile,rasterio_env_options,storage_options=None
         da = da.rechunk(chunks= (chunk_heights[0], chunk_widths[0]))
         current_level_profile = del_overview_profile
 
-    #empty_COG is slow for large COGs, its seperate here so dask can run it early
-    header_bytes = dask.delayed(empty_COG)(del_profile, rasterio_env_options= del_rasterio_env_options)
-    header_bytes_final = dask.delayed(prep_tiff_header)(header_bytes, parts_info)
+    header_bytes_final = dask.delayed(prep_tiff_header)(parts_info,del_profile,del_rasterio_env_options)
            
     #set how many mpu parts are used in each partition. 
     #these numbers have been determined from an analysis of the relative size of each overview 
@@ -404,9 +402,11 @@ def ifd_offset_adjustments(header_length,parts_info):
     #reverse as the header pages are in reverse order
     return (block_offsets[::-1], block_counts[::-1])
                               
-def prep_tiff_header(header_bytes,parts_info):
+def prep_tiff_header(parts_info,del_profile,rasterio_env_options):
     '''update the header
-    '''                             
+    '''                  
+    #empty_COG is slow for large COGs, its seperate here so dask can run it early
+    header_bytes = empty_COG(del_profile, rasterio_env_options=rasterio_env_options)
     #adjust the block data
     #print (parts_info)
     block_data = ifd_offset_adjustments(len(header_bytes),parts_info)
