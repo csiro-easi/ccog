@@ -282,7 +282,7 @@ def adjust_compression(profile):
         if k1 in profile:
             profile[k2] = profile[k1]
 
-def COG_graph_builder(da,store,profile,rasterio_env_options,storage_options=None,user_limit_bytes=None):
+def COG_graph_builder(da,profile,rasterio_env_options):
     '''
     makes a dask delayed graph that when computed writes a COG file to S3
     '''
@@ -317,7 +317,7 @@ def COG_graph_builder(da,store,profile,rasterio_env_options,storage_options=None
         #if optimize_graph=False then the data is read more optimally but the building of the graph gets slower.
         da_del = da.to_delayed(optimize_graph=False)
         res_arr = np.ndarray((len(chunk_heights),len(chunk_widths)), dtype=object)
-
+        
         for blk in da_del.ravel():
             ind = blk.key[1:]
             overview_arr,part_bytes,part_info = tif_part_maker_func(blk,current_level_profile,del_rasterio_env_options,)
@@ -338,30 +338,10 @@ def COG_graph_builder(da,store,profile,rasterio_env_options,storage_options=None
         current_level_profile = del_overview_profile
 
     header_bytes_final = dask.delayed(prep_tiff_header)(parts_info,del_profile,del_rasterio_env_options)
-           
-    #set how many mpu parts are used in each partition. 
-    #these numbers have been determined from an analysis of the relative size of each overview 
-    #parts must sum to 10000 or less
-    #pasrts should generally ahve a length of at least 3 as there may be small writes either side of a partition boundary
-    #every overview after 6 goes in 1 partition
-    partition_specs = {'header': {'length': 3, 'data': []},
-                     'last_overviews': {'length': 3, 'data': []},
-                     6: {'length': 3, 'data': []},
-                     5: {'length': 9, 'data': []},
-                     4: {'length': 32, 'data': []},
-                     3: {'length': 119, 'data': []},
-                     2: {'length': 470, 'data': []},
-                     1: {'length': 1875, 'data': []},
-                     0: {'length': 7486, 'data': []}}
-                        
-    #rearrange the delayed data into the write partitions
-    partition_specs['header']['data']=[[header_bytes_final,],]
-    for level in sorted(parts_bytes, reverse=True):#reverse so that when levels share a partition they need to be in this order
-        partition_specs.get(level,partition_specs['last_overviews'])['data'].extend(parts_bytes[level])
-    
-    #return partition_specs
-    delayed_graph = aws_tools.mpu_upload_dask_partitioned(partition_specs,store,storage_options=storage_options,user_limit_bytes = user_limit_bytes)
-    return delayed_graph
+    #sum as a shorthand for flattening a list in the right order
+    delayed_parts = sum([v for k,v in sorted(parts_bytes.items(), reverse=True)],[header_bytes_final])
+    return delayed_parts
+
 
 def ifd_updater(memfile,block_data):
     #memfile is a bytesIO object
@@ -370,6 +350,8 @@ def ifd_updater(memfile,block_data):
     with tifffile.TiffFile(memfile) as tif:
         for page,offs,cnts in zip(tif.pages,block_offsets,block_counts):
             #print (page.tags)
+            #print (offs)
+            #print (cnts)
             assert len(page.tags['TileOffsets'].value) == len(offs) == len(cnts), 'oh no data is muddled'
             page.tags['TileOffsets'].overwrite(offs)
             page.tags['TileByteCounts'].overwrite(cnts)
@@ -392,9 +374,16 @@ def ifd_offset_adjustments(header_length,parts_info):
             #note this modifies in place!
             TileOffsets[TileByteCounts > 0] += offset
             TileOffsets[TileByteCounts == 0] = 0 #sparse tif data
-            offset = TileOffsets[-1,-1] + TileByteCounts[-1,-1]
+            
+            #reset the offset for the next level
+            offset += np.sum(TileByteCounts)
+            
             TileOffsets_arr[ind] = TileOffsets
             TileByteCounts_arr[ind] = TileByteCounts
+            
+#         print ( level)    
+#         print (TileOffsets_arr)
+#         print (TileByteCounts_arr)
         #make block arrays into arrays and then flatten them
         block_offsets.append(np.block(TileOffsets_arr.tolist()).ravel())
         block_counts.append(np.block(TileByteCounts_arr.tolist()).ravel())
@@ -410,8 +399,7 @@ def prep_tiff_header(parts_info,del_profile,rasterio_env_options):
     #adjust the block data
     #print (parts_info)
     block_data = ifd_offset_adjustments(len(header_bytes),parts_info)
-    #print ('................')
-    #print (block_data)
+
     #write the block data into the header
     with io.BytesIO(header_bytes) as memfile:
         ifd_updater(memfile,block_data)
@@ -419,7 +407,7 @@ def prep_tiff_header(parts_info,del_profile,rasterio_env_options):
         header_data = memfile.getvalue()
     return header_data
     
-def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = None, storage_options = None, user_limit_bytes= None):
+def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = None, storage_options = None):
     '''writes a concatenated COG to S3
     x_arr an xarray array.
         notes on chunking:
@@ -487,6 +475,7 @@ def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = 
         raise ValueError ('non spatial dimension chunking needs to be a single chunk')
 
     #building the delayed graph
-    delayed_graph = COG_graph_builder(x_arr.data,store,profile=profile,rasterio_env_options=rasterio_env_options,storage_options=storage_options, user_limit_bytes=user_limit_bytes)
+    delayed_parts = COG_graph_builder(x_arr.data,profile=profile,rasterio_env_options=rasterio_env_options)
+    delayed_graph = aws_tools.mpu_upload_dask_partitioned(delayed_parts,store,storage_options=storage_options)
     return delayed_graph
 
