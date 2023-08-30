@@ -100,6 +100,7 @@ def xarray_to_profile(x_arr):
     )
     return profile
 
+
 def empty_COG(profile,rasterio_env_options=None,mask=False):
     """
     makes an empty sparse COG in memory
@@ -191,7 +192,7 @@ def empty_COG(profile,rasterio_env_options=None,mask=False):
                 memfileio.seek(0)
                 if not profile["COG_ghost_data"]:
                     delete_COG_ghost_header(memfileio)
-                memfile.seek(0)
+                memfileio.seek(0)
                 data_fixed = memfileio.read()
     return data_fixed
 
@@ -208,6 +209,28 @@ def delete_COG_ghost_header(memfile):
     memfile.write((43+GDAL_STRUCTURAL_METADATA_SIZE)*b"\0")
     memfile.seek(0)
     return
+
+def test_jpegtables(JPEGTables,profile,rasterio_env_options=None):
+    '''tests if jpegtables matches that for an empty tiff
+    
+    throws an error if there is a difference
+    
+    used because its not entirely clear what changes the contents of this tag
+    stop using this once comfortable that jpegtables doesnt change
+    '''
+    profile = profile.copy()
+    profile['height']= 512
+    profile['width']= 512
+    with rasterio.Env(**rasterio_env_options):
+        with rasterio.io.MemoryFile() as memfile:
+            with memfile.open(**profile) as src:
+                pass
+            memfile.seek(0)
+            with tifffile.TiffFile(memfile) as tif:
+                empty_JPEGTables = tif.pages[0].tags['JPEGTables'].value
+    if empty_JPEGTables != JPEGTables:
+        raise ValueError('different JPEGTables')
+    
 
 def partial_COG_maker(
     arr,
@@ -251,6 +274,7 @@ def partial_COG_maker(
             #return (memfile.read()) #used for testing
             with tifffile.TiffFile(memfile) as tif:
                 page = tif.pages[0]
+                test_jpegtables(page.tags['JPEGTables'].value,profile,rasterio_env_options)
             for offset, bytecount in zip(page.dataoffsets, page.databytecounts):
                 _ = memfile.seek(offset)
                 part_bytes.append(memfile.read(bytecount))
