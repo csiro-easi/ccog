@@ -220,8 +220,8 @@ def partial_COG_maker(
     Gets all the advantages of rasterio/GDALs work writing the file so dont need to do that work from scratch.
     """
     profile = profile.copy() #careful not to update in place
-    profile['height']= arr.shape[0]
-    profile['width']= arr.shape[1]
+    profile['height']= arr.shape[1]
+    profile['width']= arr.shape[2]
     #not using the transform in profile as its going to be wrong - make it obviously wrong avoids rasterio warnings
     profile['transform']= Affine.scale(2)
     #the overview is only used for resampling its not stored
@@ -237,13 +237,13 @@ def partial_COG_maker(
     with rasterio.Env(**rasterio_env_options):
         with rasterio.io.MemoryFile() as memfile:
             with memfile.open(**profile) as src:
-                src.write(arr, 1)
+                src.write(arr)
                 del arr  # reducing mem footprint
             
             if profile["overview_count"]:
                 with memfile.open(overview_level=0) as src:
                     # get the required overview back as an array
-                    overview_arr = src.read(1)
+                    overview_arr = src.read()
 
             #removing the gdal ghost leaders
             part_bytes = []
@@ -305,7 +305,7 @@ def COG_graph_builder(da,profile,rasterio_env_options):
     for level in range(profile['overview_count']+1):
         parts_info[level] = []
         parts_bytes[level] = []
-        chunk_heights, chunk_widths = da.chunks
+        chunk_depth, chunk_heights, chunk_widths = da.chunks
         #matching gdal behaviour
         if len(chunk_heights)>1 and chunk_heights[-1] ==1:
             chunk_heights = chunk_heights[:-1]
@@ -319,22 +319,22 @@ def COG_graph_builder(da,profile,rasterio_env_options):
         res_arr = np.ndarray((len(chunk_heights),len(chunk_widths)), dtype=object)
         
         for blk in da_del.ravel():
-            ind = blk.key[1:]
+            ind = blk.key[1:][-2:]
             overview_arr,part_bytes,part_info = tif_part_maker_func(blk,current_level_profile,del_rasterio_env_options,)
             parts_info[level].append((ind,part_info))
             parts_bytes[level].append(part_bytes) #((ind,part_bytes))
             
             #checks if the index falls within the array
             #throwing away overviews that are an artifact of the way gdal produces overviews when there is a dimension of 1
-            if len([1 for s,i in zip(res_arr.shape,ind) if i<s])==2:
-                blk_final_shape = (max(1,chunk_heights[ind[0]] // 2),max(1,chunk_widths[ind[1]] // 2))
+            if len([1 for s,i in zip(res_arr.shape[-2:],ind) if i<s])==2:
+                blk_final_shape = (chunk_depth[0],max(1,chunk_heights[ind[0]] // 2),max(1,chunk_widths[ind[1]] // 2))
                 res_arr[ind] = dask.array.from_delayed(overview_arr, shape=blk_final_shape, dtype=da.dtype)
 
         #if level == profile['overview_count']: #last
         #    break
         da = dask.array.block(res_arr.tolist())
         #copy the chunking from the initial data - assuming the first chunk is indicative of appropriate chunking to use for overviews
-        da = da.rechunk(chunks= (chunk_heights[0], chunk_widths[0]))
+        da = da.rechunk(chunks= (chunk_depth[0],chunk_heights[0], chunk_widths[0]))
         current_level_profile = del_overview_profile
 
     header_bytes_final = dask.delayed(prep_tiff_header)(parts_info,del_profile,del_rasterio_env_options)
@@ -468,6 +468,10 @@ def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = 
         #the tiff rule is 16 but that is a very small block, resulting in a large header. consider a 256 minimum?
         raise ValueError (f'blocksize must be multiples of 16')
 
+
+    #handle single band data the same as multiband data
+    if len(x_arr.dims) == 2:
+        x_arr = x_arr.expand_dims('band')
     #check chunking.
     if any([dim%profile['blocksize'] for dim in x_arr.data.chunks[-2][:-1]]) or any([dim%profile['blocksize'] for dim in x_arr.data.chunks[-1][:-1]]):
         raise ValueError ('chunking needs to be multiples of the blocksize (except the last in any spatial dimension)')
