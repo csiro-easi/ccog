@@ -29,18 +29,14 @@ required_creation_options = dict(
     bigtiff="YES",
     num_threads="all_cpus", #TODO: test what difference this makes if any on a dask cluster
     overviews="AUTO",
-    jpegtablesmode = 0, # will be needed when I get to multiband compressed data- doesnt work with the GDAL COG driver
-    
-    #the COG driver ignores a number of options including JPEGTABLESMODE
-    # Why does GDAL do this. as far as i can tell the COG driver requires a geotiff to be written first and then the cog is a copy from that
-    #TODO: JPEGTABLESMODE will be needed - will either need GDAl to make a change or CCOG to use the geotiff driver for some situations
-
 )
 
 default_creation_options = dict(
     geotiff_version= 1.1, #why not use the latest by default
     blocksize = 512,
     overview_resampling = rasterio.enums.Resampling.nearest,
+    compress = None,
+    overview_compress = None,
     COG_ghost_data = False,
 
 )
@@ -136,7 +132,6 @@ def empty_COG(profile,rasterio_env_options=None,mask=False):
                 if mask == True:
                     src.write_mask(False)
                 #todo include tags,scale,offset,desctription,units etc
-                #todo handle jpegtables 0
             memfile.seek(0)
             data = memfile.read()
 
@@ -157,11 +152,7 @@ def empty_COG(profile,rasterio_env_options=None,mask=False):
                         tif.pages[p.index].tags['ImageLength'].overwrite(1)
                         tif.pages[p.index].tags['TileByteCounts'].overwrite([0])
                         tif.pages[p.index].tags['TileOffsets'].overwrite([0])
-                        
-                        #experimental to see if having an empty jpegtables tag is ignored on reading
-                        #if 'JPEGTables' in p.tags:
-                        #    tif.pages[p.index].tags['JPEGTables'].overwrite(None,erase=True)
-                        
+                                                
                         if 'MASK' in str(p.tags.get('NewSubfileType','')):
                             mask.append(p)
                         else:
@@ -234,6 +225,8 @@ def test_jpegtables(JPEGTables,profile,rasterio_env_options=None):
 
 def partial_COG_maker(
     arr,
+    mask=None,
+    *,
     profile,
     rasterio_env_options,
 ):
@@ -251,46 +244,53 @@ def partial_COG_maker(
     profile["overview_compress"] = 'NONE'
     profile["overview_count"] = 1
     overview_arr = None
+    mask_overview_arr = None
     if profile['height']==1 and profile['width']==1:
         #stops gdal throwing an error
         #in the case of a 1x1 pixel input return it as the overview
         profile["overview_count"] = 0
         overview_arr = arr
+        mask_overview_arr = mask
         
     with rasterio.Env(**rasterio_env_options):
         with rasterio.io.MemoryFile() as memfile:
             with memfile.open(**profile) as src:
                 src.write(arr)
                 del arr  # reducing mem footprint
+                if mask:
+                    src.write_mask(mask)
+                    del mask
             
             if profile["overview_count"]:
                 with memfile.open(overview_level=0) as src:
                     # get the required overview back as an array
                     overview_arr = src.read()
+                    if mask:
+                        #mask is the same for all bands
+                        mask_overview_arr = src.read_masks(1)
 
             #removing the gdal ghost leaders
             part_bytes = []
             memfile.seek(0)
-            #return (memfile.read()) #used for testing
             with tifffile.TiffFile(memfile) as tif:
                 page = tif.pages[0]
-                test_jpegtables(page.tags['JPEGTables'].value,profile,rasterio_env_options)
+                if profile['compress'] == 'jpeg':
+                    test_jpegtables(page.tags['JPEGTables'].value,profile,rasterio_env_options)
             for offset, bytecount in zip(page.dataoffsets, page.databytecounts):
                 _ = memfile.seek(offset)
                 part_bytes.append(memfile.read(bytecount))
     
+    todo - extract bytes and offsets/counts for masks
+    
+    
     # data will be more flexible later as 2d numpy arrays
     tile_dims_count = (math.ceil(page.imagelength/page.tilelength),math.ceil(page.imagewidth/page.tilewidth))
-    #part_bytes = np.array(part_bytes,dtype=object).reshape(tile_col_count,-1) #not currently needed - leave as may be useful if rearranging tiles in a later step in the future
-
-    #not convinced this is the correct place to produce this data - could easily be made from the part_bytes in a later step
-    #eg use np.vectorize(len)(part_bytes) to generate databytecounts
-    #this would give flexability for rearranging the data
+   
     databytecounts = np.array(page.databytecounts,dtype=np.int64).reshape(*tile_dims_count)
-    #at some later stage sparse tiles (bytecount=0) need to have their offset set to zero before writing.
+    #note: at a later stage sparse tiles (bytecount=0) have their offset set to zero before writing.
     databyteoffsets = np.cumsum([0,*page.databytecounts[0:-1]],dtype=np.int64).reshape(*tile_dims_count)
     part_info = (databyteoffsets, databytecounts)
-    return overview_arr,part_bytes,part_info
+    return overview_arr,mask_overview_arr,part_bytes,part_info
 
 def adjust_compression(profile):
     '''
@@ -306,12 +306,12 @@ def adjust_compression(profile):
         if k1 in profile:
             profile[k2] = profile[k1]
 
-def COG_graph_builder(da,profile,rasterio_env_options):
+def COG_graph_builder(da,mask,profile,rasterio_env_options):
     '''
     makes a dask delayed graph that when computed writes a COG file to S3
     '''
     
-    tif_part_maker_func = dask.delayed(partial_COG_maker, nout=3)
+    tif_part_maker_func = dask.delayed(partial_COG_maker, nout=4)
 
     #ensure the overview count is set
     profile['overview_count'] = get_maximum_overview_level(profile['width'], profile['height'], minsize=profile['blocksize'],overview_count=profile.get('overview_count',None))
@@ -339,26 +339,37 @@ def COG_graph_builder(da,profile,rasterio_env_options):
         #this is the slowest line by far. if not optimize_graph its faster but slower overall.
         #if optimize_graph=True then the graph ends up reading in the source data many times
         #if optimize_graph=False then the data is read more optimally but the building of the graph gets slower.
-        da_del = da.to_delayed(optimize_graph=False)
+        data_del = da.to_delayed(optimize_graph=False)
         res_arr = np.ndarray((len(chunk_heights),len(chunk_widths)), dtype=object)
         
-        for blk in da_del.ravel():
-            ind = blk.key[1:][-2:]
-            overview_arr,part_bytes,part_info = tif_part_maker_func(blk,current_level_profile,del_rasterio_env_options,)
+        if mask:
+            mask_del = mask.to_delayed(optimize_graph=False)
+            data_del = zip(data_del.ravel(),mask_del.ravel())
+            mask_res_arr = np.ndarray((len(chunk_heights),len(chunk_widths)), dtype=object)
+
+        for blk in data_del:
+            ind = blk[0].key[1:][-2:]
+            overview_arr,mask_arr,part_bytes,part_info = tif_part_maker_func(*blk, profile=current_level_profile,rasterio_env_options=del_rasterio_env_options)
             parts_info[level].append((ind,part_info))
-            parts_bytes[level].append(part_bytes) #((ind,part_bytes))
+            parts_bytes[level].append(part_bytes)
             
             #checks if the index falls within the array
             #throwing away overviews that are an artifact of the way gdal produces overviews when there is a dimension of 1
             if len([1 for s,i in zip(res_arr.shape[-2:],ind) if i<s])==2:
                 blk_final_shape = (chunk_depth[0],max(1,chunk_heights[ind[0]] // 2),max(1,chunk_widths[ind[1]] // 2))
                 res_arr[ind] = dask.array.from_delayed(overview_arr, shape=blk_final_shape, dtype=da.dtype)
+                if mask:
+                    mask_res_arr[ind] = dask.array.from_delayed(mask_arr, shape=blk_final_shape, dtype=mask.dtype)
 
-        #if level == profile['overview_count']: #last
-        #    break
         da = dask.array.block(res_arr.tolist())
         #copy the chunking from the initial data - assuming the first chunk is indicative of appropriate chunking to use for overviews
         da = da.rechunk(chunks= (chunk_depth[0],chunk_heights[0], chunk_widths[0]))
+        
+        if mask:
+            mask = dask.array.block(mask_res_arr.tolist())
+            #copy the chunking from the initial data - assuming the first chunk is indicative of appropriate chunking to use for overviews
+            mask = mask.rechunk(chunks= (chunk_heights[0], chunk_widths[0]))
+        
         current_level_profile = del_overview_profile
 
     header_bytes_final = dask.delayed(prep_tiff_header)(parts_info,del_profile,del_rasterio_env_options)
@@ -431,7 +442,7 @@ def prep_tiff_header(parts_info,del_profile,rasterio_env_options):
         header_data = memfile.getvalue()
     return header_data
     
-def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = None, storage_options = None):
+def write_ccog(x_arr,store, mask=None, COG_creation_options = None, rasterio_env_options = None, storage_options = None):
     '''writes a concatenated COG to S3
     x_arr an xarray array.
         notes on chunking:
@@ -467,9 +478,11 @@ def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = 
     
     if not isinstance(x_arr,xarray.core.dataarray.DataArray):
         raise TypeError (' x_arr must be an instance of xarray.core.dataarray.DataArray')
+        
+
     
-    #normalise keys to lower case for ease of referencing
-    user_creation_options = {key.lower():val for key,val in COG_creation_options.items() }
+    #normalise keys and string values to lower case for ease of use
+    user_creation_options = {key.lower():val.lower() if isinstance(val,str) else val for key,val in COG_creation_options.items() }
     
     #throw error as these options have not been tested and likely wont work as expected
     exclude_opts = [opt for opt in ['warp_resampling','target_srs','tiling_scheme'] if opt in user_creation_options]
@@ -501,9 +514,18 @@ def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = 
         raise ValueError ('chunking needs to be multiples of the blocksize (except the last in any spatial dimension)')
     if len(x_arr.data.chunks) ==3 and len(x_arr.data.chunks[0]) > 1:
         raise ValueError ('non spatial dimension chunking needs to be a single chunk')
-
+        
+    #mask - check
+    if mask is not None:
+        if not isinstance(mask,xarray.core.dataarray.DataArray):
+            raise TypeError (' mask must be an instance of xarray.core.dataarray.DataArray')
+        if x_arr.data.chunks[-2] != mask.data.chunks:
+            raise ValueError ('mask spatial chunks needs to match those of x_arr')
+        #todo: also check CRS and transform match
+        mask = mask.data
+    
     #building the delayed graph
-    delayed_parts = COG_graph_builder(x_arr.data,profile=profile,rasterio_env_options=rasterio_env_options)
+    delayed_parts = COG_graph_builder(x_arr.data,mask,profile=profile,rasterio_env_options=rasterio_env_options)
     delayed_graph = aws_tools.mpu_upload_dask_partitioned(delayed_parts,store,storage_options=storage_options)
     return delayed_graph
 
