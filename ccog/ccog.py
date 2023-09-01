@@ -275,10 +275,9 @@ def partial_COG_maker(
                 page = tif.pages[0]
                 if profile['compress'] == 'jpeg':
                     test_jpegtables(page.tags['JPEGTables'].value,profile,rasterio_env_options)
-                        
-                tile_dims_count = (1,math.ceil(page.imagelength/page.tilelength),math.ceil(page.imagewidth/page.tilewidth))
-                if mask:
-                    tile_dims_count[0] +=1     
+                
+                #always make mask data ignore it later if not needed
+                tile_dims_count = (2,math.ceil(page.imagelength/page.tilelength),math.ceil(page.imagewidth/page.tilewidth))  
                 databytecounts = np.zeros(tile_dims_count,dtype=np.int32)
                 databytecounts[0,:,:] = np.reshape(page.databytecounts,tile_dims_count[-2:])
                 databyteoffsets = np.zeros(tile_dims_count,dtype=np.int64)
@@ -414,6 +413,7 @@ def ifd_updater(memfile,block_data,mask_data):
                 main.append(p.index)   
 
     #write the data to the ifd ensuring to interleave the main and mask offsets/bytecounts
+    #ignore mask data if there are no mask ifds
     for main_id,mask_id,main_page_data_off,main_page_data_cnts,mask_page_data_off,mask_page_data_cnts in zip_longest(main,mask,*block_data,*mask_data):
         
         _update_page(main_id,main_page_data_off,main_page_data_cnts)
@@ -455,10 +455,8 @@ def ifd_offset_adjustments(header_length,parts_info):
         block_offsets.append(TileOffsets_merged[0].ravel())
         block_counts.append(TileByteCounts_merged[0].ravel())
 
-        if TileOffsets_merged.shape[0] == 2:
-            #has mask data
-            mask_offsets.append(TileOffsets_merged[1].ravel())
-            mask_counts.append(TileByteCounts_merged[1].ravel())
+        mask_offsets.append(TileOffsets_merged[1].ravel())
+        mask_counts.append(TileByteCounts_merged[1].ravel())
             
     #reverse as the header pages are in reverse order
     return (block_offsets[::-1], block_counts[::-1]),(mask_offsets[::-1], mask_counts[::-1])
