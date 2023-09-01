@@ -21,22 +21,22 @@ import tifffile
 
 from . import aws_tools
 
-
+required_rasterio_env_options = dict(gdal_tiff_internal_mask = True)#only needed if switching to use the Gtiff driver
 
 required_creation_options = dict(
-    sparse_ok=True,
-    driver="COG",
-    bigtiff="YES",
+    driver="cog",
+    bigtiff="yes",
     num_threads="all_cpus", #TODO: test what difference this makes if any on a dask cluster
-    overviews="AUTO",
+    tiled = 'yes', #only needed if switching to use the Gtiff driver
+    overviews="auto",
 )
 
 default_creation_options = dict(
+    sparse_ok=True,
     geotiff_version= 1.1, #why not use the latest by default
     blocksize = 512,
     overview_resampling = rasterio.enums.Resampling.nearest,
     compress = None,
-    overview_compress = None,
     COG_ghost_data = False,
 
 )
@@ -129,62 +129,62 @@ def empty_COG(profile,rasterio_env_options=None,mask=False):
             with memfile.open(**prof) as src:
                 if "colormap" in profile:
                     src.write_colormap(1, profile["colormap"])
-                if mask == True:
+                if mask:
                     src.write_mask(False)
                 #todo include tags,scale,offset,desctription,units etc
             memfile.seek(0)
             data = memfile.read()
 
-            with io.BytesIO(data) as memfileio:
+    with io.BytesIO(data) as memfileio:
+        with tifffile.TiffFile(memfileio) as tif:
+            main_page_ids = []
+            mask_page_ids=[]
+            trash_offsets = []
+            for p in tif.pages:
+                if p.tags['TileOffsets'].valueoffset > p.tags['TileOffsets'].offset + 12:
+                    trash_offsets.append(p.tags['TileOffsets'].valueoffset)
+                #adjust for gdal cog ghost leader
+                trash_offsets.extend(v-4 for v in p.tags['TileOffsets'].value if v != 0)
+                if p.tags['TileByteCounts'].valueoffset > p.tags['TileByteCounts'].offset + 12:
+                    trash_offsets.append(p.tags['TileByteCounts'].valueoffset)
+
+                tif.pages[p.index].tags['ImageWidth'].overwrite(1)
+                tif.pages[p.index].tags['ImageLength'].overwrite(1)
+                tif.pages[p.index].tags['TileByteCounts'].overwrite([0])
+                tif.pages[p.index].tags['TileOffsets'].overwrite([0])
+
+                if 'MASK' in str(p.tags.get('NewSubfileType','')):
+                    main_page_ids.append(p.index)
+                else:
+                    main_page_ids.append(p.index)
+        #truncate file to get rid of old offsets and counts data
+        if trash_offsets:
+            memfileio.truncate(min(trash_offsets))         
+        h = profile['height']
+        w = profile['width']
+        for main_and_mask in zip_longest(main_page_ids,main_page_ids):
+            num_tiles = math.ceil(h/profile["blocksize"])*math.ceil(w/profile["blocksize"])
+            for p in main_and_mask:
+                #interleaving the main and mask offsets/bytecounts
+                if p is None:
+                    #no mask
+                    continue
+                #tifffile gave warnings if editing offsets and bytes at once. so opening and closing the file to avoid this
+                memfileio.seek(0)
                 with tifffile.TiffFile(memfileio) as tif:
-                    main = []
-                    mask=[]
-                    trash_offsets = []
-                    for p in tif.pages:
-                        if p.tags['TileOffsets'].valueoffset > p.tags['TileOffsets'].offset + 12:
-                            trash_offsets.append(p.tags['TileOffsets'].valueoffset)
-                        #adjust for gdal cog ghost leader
-                        trash_offsets.extend(v-4 for v in p.tags['TileOffsets'].value if v != 0)
-                        if p.tags['TileByteCounts'].valueoffset > p.tags['TileByteCounts'].offset + 12:
-                            trash_offsets.append(p.tags['TileByteCounts'].valueoffset)
-                            
-                        tif.pages[p.index].tags['ImageWidth'].overwrite(1)
-                        tif.pages[p.index].tags['ImageLength'].overwrite(1)
-                        tif.pages[p.index].tags['TileByteCounts'].overwrite([0])
-                        tif.pages[p.index].tags['TileOffsets'].overwrite([0])
-                                                
-                        if 'MASK' in str(p.tags.get('NewSubfileType','')):
-                            mask.append(p)
-                        else:
-                            main.append(p)
-                #truncate file to get rid of old offsets and counts data
-                if trash_offsets:
-                    memfileio.truncate(min(trash_offsets))         
-                h = profile['height']
-                w = profile['width']
-                for main_and_mask in zip_longest(main,mask):
-                    num_tiles = math.ceil(h/profile["blocksize"])*math.ceil(w/profile["blocksize"])
-                    for p in main_and_mask:
-                        #interleaving the main and mask offsets/bytecounts
-                        if p is None:
-                            #no mask
-                            continue
-                        #tifffile gave warnings if editing offsets and bytes at once. so opening and closing the file to avoid this
-                        memfileio.seek(0)
-                        with tifffile.TiffFile(memfileio) as tif:
-                            tif.pages[p.index].tags['ImageWidth'].overwrite(w,dtype='I')
-                            tif.pages[p.index].tags['ImageLength'].overwrite(h,dtype='I')
-                            tif.pages[p.index].tags['TileOffsets'].overwrite([0]*num_tiles)
-                        memfileio.seek(0)
-                        with tifffile.TiffFile(memfileio) as tif:
-                            tif.pages[p.index].tags['TileByteCounts'].overwrite([0]*num_tiles)
-                    h =max(1,h//2)
-                    w =max(1,w//2)
+                    tif.pages[p].tags['ImageWidth'].overwrite(w,dtype='I')
+                    tif.pages[p].tags['ImageLength'].overwrite(h,dtype='I')
+                    tif.pages[p].tags['TileOffsets'].overwrite([0]*num_tiles)
                 memfileio.seek(0)
-                if not profile["COG_ghost_data"]:
-                    delete_COG_ghost_header(memfileio)
-                memfileio.seek(0)
-                data_fixed = memfileio.read()
+                with tifffile.TiffFile(memfileio) as tif:
+                    tif.pages[p].tags['TileByteCounts'].overwrite([0]*num_tiles)
+            h =max(1,h//2)
+            w =max(1,w//2)
+        memfileio.seek(0)
+        if not profile["COG_ghost_data"]:
+            delete_COG_ghost_header(memfileio)
+        memfileio.seek(0)
+        data_fixed = memfileio.read()
     return data_fixed
 
 def delete_COG_ghost_header(memfile):
@@ -270,27 +270,44 @@ def partial_COG_maker(
                         mask_overview_arr = src.read_masks(1)
 
             #removing the gdal ghost leaders
-            part_bytes = []
             memfile.seek(0)
             with tifffile.TiffFile(memfile) as tif:
                 page = tif.pages[0]
                 if profile['compress'] == 'jpeg':
                     test_jpegtables(page.tags['JPEGTables'].value,profile,rasterio_env_options)
-            for offset, bytecount in zip(page.dataoffsets, page.databytecounts):
-                _ = memfile.seek(offset)
-                part_bytes.append(memfile.read(bytecount))
-    
-    todo - extract bytes and offsets/counts for masks
-    
-    
-    # data will be more flexible later as 2d numpy arrays
-    tile_dims_count = (math.ceil(page.imagelength/page.tilelength),math.ceil(page.imagewidth/page.tilewidth))
-   
-    databytecounts = np.array(page.databytecounts,dtype=np.int64).reshape(*tile_dims_count)
-    #note: at a later stage sparse tiles (bytecount=0) have their offset set to zero before writing.
-    databyteoffsets = np.cumsum([0,*page.databytecounts[0:-1]],dtype=np.int64).reshape(*tile_dims_count)
-    part_info = (databyteoffsets, databytecounts)
-    return overview_arr,mask_overview_arr,part_bytes,part_info
+                        
+                tile_dims_count = (1,math.ceil(page.imagelength/page.tilelength),math.ceil(page.imagewidth/page.tilewidth))
+                if mask:
+                    tile_dims_count[0] +=1     
+                databytecounts = np.zeros(tile_dims_count,dtype=np.int32)
+                databytecounts[0,:,:] = np.reshape(page.databytecounts,tile_dims_count[-2:])
+                databyteoffsets = np.zeros(tile_dims_count,dtype=np.int64)
+                databyteoffsets[0,:,:] = np.reshape(page.dataoffsets,tile_dims_count[-2:])
+                if mask:
+                    mask_page = tif.pages[1]
+                    databytecounts[1,:,:] = np.reshape(mask_page.databytecounts,tile_dims_count[-2:])
+                    databyteoffsets[1,:,:] = np.reshape(mask_page.dataoffsets,tile_dims_count[-2:])
+            
+            new_databyteoffsets = []
+            current_offset = 0
+            part_bytes = bytearray()
+            #ravel with 'f' order to interleave data and mask. Collect up bytes and optional gdal leading and trailing ghosts
+            for offset, bytecount in zip(databyteoffsets.ravel('f'), databytecounts.ravel('f')):
+                new_databyteoffsets.append(current_offset) #sparse values get reset to zero later
+                if bytecount:
+                    if profile["COG_ghost_data"]:
+                        part_bytes.extend(bytecount.tobytes())
+                        current_offset += 4
+                    _ = memfile.seek(offset)
+                    part_bytes.extend(memfile.read(bytecount))
+                    current_offset += bytecount
+                    if profile["COG_ghost_data"]:
+                        part_bytes.extend(part_bytes[-4:])
+                        current_offset += 4
+                    
+    databyteoffsets = np.reshape(new_databyteoffsets,tile_dims_count)
+    part_info = (databyteoffsets, databytecounts,len(part_bytes))
+    return overview_arr,mask_overview_arr,bytes(part_bytes),part_info
 
 def adjust_compression(profile):
     '''
@@ -346,6 +363,8 @@ def COG_graph_builder(da,mask,profile,rasterio_env_options):
             mask_del = mask.to_delayed(optimize_graph=False)
             data_del = zip(data_del.ravel(),mask_del.ravel())
             mask_res_arr = np.ndarray((len(chunk_heights),len(chunk_widths)), dtype=object)
+        else:
+            data_del = zip(data_del.ravel())
 
         for blk in data_del:
             ind = blk[0].key[1:][-2:]
@@ -364,10 +383,8 @@ def COG_graph_builder(da,mask,profile,rasterio_env_options):
         da = dask.array.block(res_arr.tolist())
         #copy the chunking from the initial data - assuming the first chunk is indicative of appropriate chunking to use for overviews
         da = da.rechunk(chunks= (chunk_depth[0],chunk_heights[0], chunk_widths[0]))
-        
         if mask:
             mask = dask.array.block(mask_res_arr.tolist())
-            #copy the chunking from the initial data - assuming the first chunk is indicative of appropriate chunking to use for overviews
             mask = mask.rechunk(chunks= (chunk_heights[0], chunk_widths[0]))
         
         current_level_profile = del_overview_profile
@@ -378,19 +395,32 @@ def COG_graph_builder(da,mask,profile,rasterio_env_options):
     return delayed_parts
 
 
-def ifd_updater(memfile,block_data):
+def ifd_updater(memfile,block_data,mask_data):
     #memfile is a bytesIO object
     assert not memfile.closed, "memory file was closed before writing"
-    block_offsets,block_counts = block_data
+    
+    def _update_page(page_id,block_offsets,block_counts):
+        tif.pages[page_id].tags['TileOffsets'].overwrite(block_offsets)
+        tif.pages[page_id].tags['TileByteCounts'].overwrite(block_counts)
+    #first gather the indexes for main and mask pages
+    memfile.seek(0)
     with tifffile.TiffFile(memfile) as tif:
-        for page,offs,cnts in zip(tif.pages,block_offsets,block_counts):
-            #print (page.tags)
-            #print (offs)
-            #print (cnts)
-            assert len(page.tags['TileOffsets'].value) == len(offs) == len(cnts), 'oh no data is muddled'
-            page.tags['TileOffsets'].overwrite(offs)
-            page.tags['TileByteCounts'].overwrite(cnts)
+        main = []
+        mask = []
+        for p in tif.pages:
+            if 'MASK' in str(p.tags.get('NewSubfileType','')):
+                mask.append(p.index)
+            else:
+                main.append(p.index)   
+
+    #write the data to the ifd ensuring to interleave the main and mask offsets/bytecounts
+    for main_id,mask_id,main_page_data_off,main_page_data_cnts,mask_page_data_off,mask_page_data_cnts in zip_longest(main,mask,*block_data,*mask_data):
         
+        _update_page(main_id,main_page_data_off,main_page_data_cnts)
+        if mask_id is not None:
+            _update_page(mask_id,mask_page_data_off,mask_page_data_cnts)
+
+
 def ifd_offset_adjustments(header_length,parts_info):
     '''
     merging of ifd data into the right order needed for the concatenated COG tif header
@@ -398,33 +428,40 @@ def ifd_offset_adjustments(header_length,parts_info):
     '''
     block_offsets = []
     block_counts = []
+    mask_offsets = []
+    mask_counts = []
     #apply cumulative offsets to tile offset data
     offset = header_length
     #the order produced is right except the levels need reversing - should match the order data is written to file
     for level in sorted(parts_info, reverse=True):
-        shp = [xy+1 for xy in parts_info[level][-1][0]]
-        TileOffsets_arr = np.ndarray(shp, dtype=object)
-        TileByteCounts_arr = np.ndarray(shp, dtype=object)
-        for ind,(TileOffsets, TileByteCounts) in parts_info[level]:
+        blk_ind_last_blk = [xy+1 for xy in parts_info[level][-1][0]]
+        TileOffsets_arr = np.ndarray(blk_ind_last_blk, dtype=object)
+        TileByteCounts_arr = np.ndarray(blk_ind_last_blk, dtype=object)
+        for ind,(TileOffsets, TileByteCounts,bytes_total_len) in parts_info[level]:
             #note this modifies in place!
             TileOffsets[TileByteCounts > 0] += offset
             TileOffsets[TileByteCounts == 0] = 0 #sparse tif data
             
-            #reset the offset for the next level
-            offset += np.sum(TileByteCounts)
+            #set the offset for the next level
+            offset += bytes_total_len
             
             TileOffsets_arr[ind] = TileOffsets
             TileByteCounts_arr[ind] = TileByteCounts
             
-#         print ( level)    
-#         print (TileOffsets_arr)
-#         print (TileByteCounts_arr)
         #make block arrays into arrays and then flatten them
-        block_offsets.append(np.block(TileOffsets_arr.tolist()).ravel())
-        block_counts.append(np.block(TileByteCounts_arr.tolist()).ravel())
+        TileOffsets_merged = np.block(TileOffsets_arr.tolist())
+        TileByteCounts_merged  = np.block(TileByteCounts_arr.tolist())
+        
+        block_offsets.append(TileOffsets_merged[0].ravel())
+        block_counts.append(TileByteCounts_merged[0].ravel())
 
+        if TileOffsets_merged.shape[0] == 2:
+            #has mask data
+            mask_offsets.append(TileOffsets_merged[1].ravel())
+            mask_counts.append(TileByteCounts_merged[1].ravel())
+            
     #reverse as the header pages are in reverse order
-    return (block_offsets[::-1], block_counts[::-1])
+    return (block_offsets[::-1], block_counts[::-1]),(mask_offsets[::-1], mask_counts[::-1])
                               
 def prep_tiff_header(parts_info,del_profile,rasterio_env_options):
     '''update the header
@@ -433,23 +470,23 @@ def prep_tiff_header(parts_info,del_profile,rasterio_env_options):
     header_bytes = empty_COG(del_profile, rasterio_env_options=rasterio_env_options)
     #adjust the block data
     #print (parts_info)
-    block_data = ifd_offset_adjustments(len(header_bytes),parts_info)
+    block_data,mask_data = ifd_offset_adjustments(len(header_bytes),parts_info)
 
     #write the block data into the header
     with io.BytesIO(header_bytes) as memfile:
-        ifd_updater(memfile,block_data)
+        ifd_updater(memfile,block_data,mask_data)
         memfile.seek(0)
         header_data = memfile.getvalue()
     return header_data
     
-def write_ccog(x_arr,store, mask=None, COG_creation_options = None, rasterio_env_options = None, storage_options = None):
+def write_ccog(x_arr, store=None, mask=None, COG_creation_options = None, rasterio_env_options = None, storage_options = None):
     '''writes a concatenated COG to S3
     x_arr an xarray array.
         notes on chunking:
         ccog is picky about chunking and will tell you about it.
         chunks should have xa nd y dimensions of multiples of the blocksize
         the last chunk in the x  and y dimensions do not have this limitation.
-    store is an s3 file path or fsspec mapping
+    store is an s3 file path or fsspec mapping, If not included that return graph will produce a list of bytes that make up the COG file
     storage_options (dict, optional) – Any additional parameters for the storage backend
     COG_creation_options (dict, optional) – options as described here https://gdal.org/drivers/raster/cog.html#creation-options
         unlike gdal resampling defaults to nearest unless specified
@@ -483,9 +520,19 @@ def write_ccog(x_arr,store, mask=None, COG_creation_options = None, rasterio_env
     
     #normalise keys and string values to lower case for ease of use
     user_creation_options = {key.lower():val.lower() if isinstance(val,str) else val for key,val in COG_creation_options.items() }
+    rasterio_env_options = {key.lower():val.lower() if isinstance(val,str) else val for key,val in rasterio_env_options.items() }
     
     #throw error as these options have not been tested and likely wont work as expected
-    exclude_opts = [opt for opt in ['warp_resampling','target_srs','tiling_scheme'] if opt in user_creation_options]
+    incompatable_options = ['warp_resampling',
+                            'target_srs',
+                            'tiling_scheme',
+                            'interleave', #not currently available in the COG driver but if set to BAND the code will need some further work
+                            'jpegtablesmode',  #not currently available in the COG driver but if becomes available will need testing
+                            'blockxsize',
+                            'blockysize',                            
+                           ]
+    incompatable_options.extend (required_creation_options.keys())
+    exclude_opts = [opt for opt in incompatable_options if opt in user_creation_options]
     if exclude_opts:
         raise ValueError (f'ccog cant work with COG_creation_options of {exclude_opts}')
                 
@@ -495,16 +542,19 @@ def write_ccog(x_arr,store, mask=None, COG_creation_options = None, rasterio_env
     
     #todo: raise error if required_creation_options are going to change user_creation_options
 
-    #build the profile from layering profile sources sequentially making sure most important end up with precendence.
+    #build the profile and env_options by layering sources sequentially making sure most important end up with precendence.
     profile = default_creation_options.copy()
     profile.update(xarray_to_profile(x_arr))
     profile.update(user_creation_options)
     profile.update(required_creation_options)
     
+    rasterio_env_options = rasterio_env_options.copy()
+    rasterio_env_options.update(required_rasterio_env_options)
+    
     if int(profile['blocksize']) % 16: 
         #the tiff rule is 16 but that is a very small block, resulting in a large header. consider a 256 minimum?
         raise ValueError (f'blocksize must be multiples of 16')
-
+    profile['blockxsize'] = profile['blockysize'] = profile['blocksize']
 
     #handle single band data the same as multiband data
     if len(x_arr.dims) == 2:
@@ -525,7 +575,8 @@ def write_ccog(x_arr,store, mask=None, COG_creation_options = None, rasterio_env
         mask = mask.data
     
     #building the delayed graph
-    delayed_parts = COG_graph_builder(x_arr.data,mask,profile=profile,rasterio_env_options=rasterio_env_options)
-    delayed_graph = aws_tools.mpu_upload_dask_partitioned(delayed_parts,store,storage_options=storage_options)
+    delayed_graph = COG_graph_builder(x_arr.data,mask,profile=profile,rasterio_env_options=rasterio_env_options)
+    if store:
+        delayed_graph = aws_tools.mpu_upload_dask_partitioned(delayed_graph,store,storage_options=storage_options)
     return delayed_graph
 
