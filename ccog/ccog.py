@@ -305,7 +305,7 @@ def partial_COG_maker(
                         part_bytes.extend(part_bytes[-4:])
                         current_offset += 4
                     
-    databyteoffsets = np.reshape(new_databyteoffsets,tile_dims_count)
+    databyteoffsets = np.reshape(new_databyteoffsets,tile_dims_count,order='f')
     part_info = (databyteoffsets, databytecounts,len(part_bytes))
     return overview_arr,mask_overview_arr,bytes(part_bytes),part_info
 
