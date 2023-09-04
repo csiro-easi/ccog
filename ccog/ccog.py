@@ -106,8 +106,6 @@ def empty_COG(profile,rasterio_env_options=None,mask=False):
     #then tifffile is used to massage the file to the correct dimensions.
 
     rasterio_env_options = {} if rasterio_env_options is None else rasterio_env_options
-    #this is applied elsewhere but apply here for when testing
-    profile.update(required_creation_options)
    
     prof = profile.copy()
     #Note that gdal has an issue that throws an error if dim is over blocksize and overview_count is zero
@@ -511,13 +509,13 @@ def write_ccog(arr, store=None, mask=None, COG_creation_options = None, rasterio
     rasterio_env_options.update(required_rasterio_env_options)
     
     #throw error as these options have not been tested and likely wont work as expected
-    incompatable_options = ['warp_resampling',
-                            'target_srs',
-                            'tiling_scheme',
-                            'interleave', #not currently available in the COG driver but if set to BAND the code will need some further work
-                            'jpegtablesmode',  #not currently available in the COG driver but if becomes available will need testing
-                            'blockxsize',
-                            'blockysize',                            
+    incompatable_options = ['warp_resampling', # no reprojection allowed
+                            'target_srs', # no reprojection allowed
+                            'tiling_scheme', # no reprojection allowed
+                            'interleave', # not currently available in the COG driver but if set to BAND the code will need some further work
+                            'jpegtablesmode',  # not currently available in the COG driver but if becomes available will need testing
+                            'blockxsize', # use blocksize
+                            'blockysize', # use blocksize             
                            ]
     incompatable_options.extend (required_creation_options.keys())
     exclude_opts = [opt for opt in incompatable_options if opt in user_creation_options]
@@ -528,7 +526,7 @@ def write_ccog(arr, store=None, mask=None, COG_creation_options = None, rasterio
         user_creation_options['overview_resampling'] = user_creation_options['resampling']
         del user_creation_options['resampling']
 
-    if not isinstance(arr,[xarray.core.dataarray.DataArray,dask.array.core.Array]):
+    if not isinstance(arr,(xarray.core.dataarray.DataArray,dask.array.core.Array)):
         raise TypeError (' arr must be an instance of xarray DataArray or dask Array')
 
     #todo: raise error if required_creation_options are going to change user_creation_options
@@ -558,14 +556,18 @@ def write_ccog(arr, store=None, mask=None, COG_creation_options = None, rasterio
         raise ValueError ('chunking needs to be multiples of the blocksize (except the last in any spatial dimension)')
     if len(arr.chunks) ==3 and len(arr.chunks[0]) > 1:
         raise ValueError ('non spatial dimension chunking needs to be a single chunk')
+        
+    #keep the ghost data if the chunking allows it
+    if all([dim == profile['blocksize'] for dim in arr.chunks[-2][:-1]]) or len(arr.chunks[-1])==1:
+        profile["cog_ghost_data"] = True
     
-    profile['count'] = da.shape[0]
-    profile['height'] = da.shape[1]
-    profile['width'] = da.shape[2]
+    profile['count'] = arr.shape[0]
+    profile['height'] = arr.shape[1]
+    profile['width'] = arr.shape[2]
 
     #mask - check
     if mask is not None:
-        if not isinstance(mask,[xarray.core.dataarray.DataArray,dask.array.core.Array]):
+        if not isinstance(mask,(xarray.core.dataarray.DataArray,dask.array.core.Array)):
             raise TypeError (' mask must be an instance of xarray DataArray or dask Array')
         if isinstance(mask,xarray.core.dataarray.DataArray):
             mask = mask.data
