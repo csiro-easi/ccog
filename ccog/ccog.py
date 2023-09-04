@@ -1,23 +1,16 @@
 __all__ = ['write_ccog']
 
-from contextlib import suppress
-from itertools import zip_longest
-from collections import deque
-import math
 import io
-import struct
-import xml.etree.ElementTree as ET
-import numpy as np
-import xarray
+import math
+from itertools import zip_longest
+
 import dask
-from distributed import get_client
-from dask.base import tokenize
+import numpy as np
 import rasterio
-from rasterio import shutil #cant see it ifs not imported apparently
+import tifffile
+import xarray
 #from rasterio.rio.overview import get_maximum_overview_level
 from affine import Affine
-
-import tifffile
 
 from . import aws_tools
 
@@ -577,4 +570,3 @@ def write_ccog(x_arr, store=None, mask=None, COG_creation_options = None, raster
     if store:
         delayed_graph = aws_tools.mpu_upload_dask_partitioned(delayed_graph,store,storage_options=storage_options)
     return delayed_graph
-

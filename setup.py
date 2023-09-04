@@ -15,9 +15,9 @@ setup(
         'xarray',
         'rasterio',
         'dask',
-        'distributed',
         'tifffile',
         'affine>=2.4', #recent bug fix
+        'more_itertools',
         ],
     entry_points={
         'console_scripts': []

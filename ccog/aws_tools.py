@@ -10,16 +10,12 @@
 # fs.call_s3 is nice to use as in handles errors and retries.
 
 
-import math
-from collections import deque
-from itertools import count, zip_longest
+from itertools import zip_longest
 
 import dask
 import fsspec
 import numpy as np
 from more_itertools import collapse
-from osgeo import gdal
-from rasterio._path import _parse_path, _vsi_path
 
 # s3 part limit docs https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
 # actually 1 to 10,000 (inclusive)
@@ -45,25 +41,6 @@ def _resolve_store(store, storage_options=None):
         "s3" in store.fs.protocol
     ), "this tool only works with the s3 file system at this stage"
     return store
-
-
-def s3_to_vrt(store, vrtpath="s3.vrt", expiration=8 * 60 * 60, storage_options=None):
-    """makes a vrt file that points to a presigned url on s3
-
-    useful for legacy GIS (arcmap) that cant open data from a url
-
-    store is an s3 file path or fsspec mapping
-    vrtpath - output filename for a .vrt file
-    expiration (int, optional) - The number of seconds that the url is valid for
-    storage_options (dict, optional) – Any additional parameters for the storage backend
-    """
-    storage_options = {} if storage_options is None else storage_options
-    store = _resolve_store(store, storage_options)
-    url = store.fs.url(store.root, expiration)
-    # todo: rasterio is currently adding vrt building functionality - switch to use that when its ready.
-    ds = gdal.BuildVRT(vrtpath, _vsi_path(_parse_path(url)))
-    ds.FlushCache()
-    ds = None
 
 
 def presigned_url(store, expiration=8 * 60 * 60, storage_options=None):
