@@ -552,7 +552,7 @@ def write_ccog(arr, store=None, mask=None, COG_creation_options = None, rasterio
 
     #handle single band data the same as multiband data
     if len(arr.shape) == 2:
-        arr = arr.reshape([1] + [*da.data.shape])
+        arr = arr.reshape([1] + [*arr.shape])
     #check chunking.
     if any([dim%profile['blocksize'] for dim in arr.chunks[-2][:-1]]) or any([dim%profile['blocksize'] for dim in arr.chunks[-1][:-1]]):
         raise ValueError ('chunking needs to be multiples of the blocksize (except the last in any spatial dimension)')
