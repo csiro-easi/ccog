@@ -7,6 +7,7 @@ from itertools import zip_longest
 import dask
 import numpy as np
 import rasterio
+import rioxarray
 import tifffile
 import xarray
 #from rasterio.rio.overview import get_maximum_overview_level
@@ -75,19 +76,6 @@ def get_maximum_overview_level(width, height, minsize=256,overview_count=None):
             overview_level += 1
 
     return overview_level
-
-
-def xarray_to_profile(x_arr):
-    profile = dict(        
-        dtype = x_arr.dtype.name,
-        width = x_arr.rio.width,
-        height = x_arr.rio.height,
-        transform = x_arr.rio.transform(),
-        crs = x_arr.rio.crs,
-        nodata = x_arr.rio.nodata,
-        count = x_arr.rio.count,
-    )
-    return profile
 
 
 def empty_COG(profile,rasterio_env_options=None,mask=False):
@@ -483,9 +471,9 @@ def prep_tiff_header(parts_info,del_profile,rasterio_env_options):
         header_data = memfile.getvalue()
     return header_data
     
-def write_ccog(x_arr, store=None, mask=None, COG_creation_options = None, rasterio_env_options = None, storage_options = None):
+def write_ccog(arr, store=None, mask=None, COG_creation_options = None, rasterio_env_options = None, storage_options = None):
     '''writes a concatenated COG to S3
-    x_arr an xarray array.
+    arr a dask or xarray array.
         notes on chunking:
         ccog is picky about chunking and will tell you about it.
         chunks should have xa nd y dimensions of multiples of the blocksize
@@ -514,17 +502,13 @@ def write_ccog(x_arr, store=None, mask=None, COG_creation_options = None, raster
     COG_creation_options = {} if COG_creation_options is None else COG_creation_options
     rasterio_env_options = {} if rasterio_env_options is None else rasterio_env_options
     storage_options = {} if storage_options is None else storage_options
-    
-    print ('warning ccog is only a proof of concept at this stage.... enjoy')
-    
-    if not isinstance(x_arr,xarray.core.dataarray.DataArray):
-        raise TypeError (' x_arr must be an instance of xarray.core.dataarray.DataArray')
         
-
-    
     #normalise keys and string values to lower case for ease of use
     user_creation_options = {key.lower():val.lower() if isinstance(val,str) else val for key,val in COG_creation_options.items() }
     rasterio_env_options = {key.lower():val.lower() if isinstance(val,str) else val for key,val in rasterio_env_options.items() }
+        
+    rasterio_env_options = rasterio_env_options.copy()
+    rasterio_env_options.update(required_rasterio_env_options)
     
     #throw error as these options have not been tested and likely wont work as expected
     incompatable_options = ['warp_resampling',
@@ -543,17 +527,23 @@ def write_ccog(x_arr, store=None, mask=None, COG_creation_options = None, raster
     if 'overview_resampling' not in user_creation_options and 'resampling' in user_creation_options:
         user_creation_options['overview_resampling'] = user_creation_options['resampling']
         del user_creation_options['resampling']
-    
-    #todo: raise error if required_creation_options are going to change user_creation_options
 
+    if not isinstance(arr,[xarray.core.dataarray.DataArray,dask.array.core.Array]):
+        raise TypeError (' arr must be an instance of xarray DataArray or dask Array')
+
+    #todo: raise error if required_creation_options are going to change user_creation_options
     #build the profile and env_options by layering sources sequentially making sure most important end up with precendence.
     profile = default_creation_options.copy()
-    profile.update(xarray_to_profile(x_arr))
+    
+    #get useful stuff from xarray via rioxarray
+    if isinstance(arr,xarray.core.dataarray.DataArray):
+        profile['transform'] = arr.rio.transform()
+        profile['crs'] = arr.rio.crs
+        profile['nodata'] = arr.rio.nodata
+        arr = arr.data
+
     profile.update(user_creation_options)
     profile.update(required_creation_options)
-    
-    rasterio_env_options = rasterio_env_options.copy()
-    rasterio_env_options.update(required_rasterio_env_options)
     
     if int(profile['blocksize']) % 16: 
         #the tiff rule is 16 but that is a very small block, resulting in a large header. consider a 256 minimum?
@@ -561,25 +551,30 @@ def write_ccog(x_arr, store=None, mask=None, COG_creation_options = None, raster
     profile['blockxsize'] = profile['blockysize'] = profile['blocksize']
 
     #handle single band data the same as multiband data
-    if len(x_arr.dims) == 2:
-        x_arr = x_arr.expand_dims('band')
+    if len(arr.shape) == 2:
+        arr = arr.reshape([1] + [*da.data.shape])
     #check chunking.
-    if any([dim%profile['blocksize'] for dim in x_arr.data.chunks[-2][:-1]]) or any([dim%profile['blocksize'] for dim in x_arr.data.chunks[-1][:-1]]):
+    if any([dim%profile['blocksize'] for dim in arr.chunks[-2][:-1]]) or any([dim%profile['blocksize'] for dim in arr.chunks[-1][:-1]]):
         raise ValueError ('chunking needs to be multiples of the blocksize (except the last in any spatial dimension)')
-    if len(x_arr.data.chunks) ==3 and len(x_arr.data.chunks[0]) > 1:
+    if len(arr.chunks) ==3 and len(arr.chunks[0]) > 1:
         raise ValueError ('non spatial dimension chunking needs to be a single chunk')
-        
+    
+    profile['count'] = da.shape[0]
+    profile['height'] = da.shape[1]
+    profile['width'] = da.shape[2]
+
     #mask - check
     if mask is not None:
-        if not isinstance(mask,xarray.core.dataarray.DataArray):
-            raise TypeError (' mask must be an instance of xarray.core.dataarray.DataArray')
-        if x_arr.data.chunks[-2] != mask.data.chunks:
-            raise ValueError ('mask spatial chunks needs to match those of x_arr')
+        if not isinstance(mask,[xarray.core.dataarray.DataArray,dask.array.core.Array]):
+            raise TypeError (' mask must be an instance of xarray DataArray or dask Array')
+        if isinstance(mask,xarray.core.dataarray.DataArray):
+            mask = mask.data
+        if arr.chunks[-2] != mask.data.chunks:
+            raise ValueError ('mask spatial chunks needs to match those of arr')
         #todo: also check CRS and transform match
-        mask = mask.data
     
     #building the delayed graph
-    delayed_graph = COG_graph_builder(x_arr.data,mask,profile=profile,rasterio_env_options=rasterio_env_options)
+    delayed_graph = COG_graph_builder(arr,mask,profile=profile,rasterio_env_options=rasterio_env_options)
     if store:
         delayed_graph = aws_tools.mpu_upload_dask_partitioned(delayed_graph,store,storage_options=storage_options)
     return delayed_graph

@@ -14,6 +14,7 @@ setup(
         'numpy',
         'xarray',
         'rasterio',
+        'rioxarray',
         'dask',
         'tifffile',
         'affine>=2.4', #recent bug fix
