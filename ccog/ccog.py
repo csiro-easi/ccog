@@ -30,7 +30,7 @@ default_creation_options = dict(
     blocksize = 512,
     overview_resampling = rasterio.enums.Resampling.nearest,
     compress = None,
-    COG_ghost_data = False,
+    cog_ghost_data = False,
 
 )
 
@@ -98,6 +98,17 @@ def empty_COG(profile,rasterio_env_options=None,mask=False):
     and as the starting point for some file format fiddling.
     
     faster then doing this directly with rasterio
+    
+    output should match output from this code:
+    with rasterio.Env(**rasterio_env_options):
+        with rasterio.io.MemoryFile() as memfile:
+            with memfile.open(**profile) as src:
+                pass
+            memfile.seek(0)
+            data_rio = memfile.read()
+    Note: it very slightly differs in some cases (where the ifd length isnt divisible by 2 - jpeg compressing seems to have this issue)
+    where tifffile and gdal layout 1 byte differently
+    
 
     returns bytes
     """
@@ -111,8 +122,7 @@ def empty_COG(profile,rasterio_env_options=None,mask=False):
     profile.update(required_creation_options)
    
     prof = profile.copy()
-    #if overview count isnt preset use  max([profile['height'],profile['width']])
-    #however note that gdal has an issue that throws an error if dim is over blocksize and overview_count is zero
+    #Note that gdal has an issue that throws an error if dim is over blocksize and overview_count is zero
     prof['height'] = 2**profile['overview_count']
     prof['width'] = 1
     
@@ -152,7 +162,7 @@ def empty_COG(profile,rasterio_env_options=None,mask=False):
                     main_page_ids.append(p.index)
         #truncate file to get rid of old offsets and counts data
         if trash_offsets:
-            memfileio.truncate(min(trash_offsets))         
+            memfileio.truncate(min(trash_offsets))
         h = profile['height']
         w = profile['width']
         for main_and_mask in zip_longest(main_page_ids,main_page_ids):
@@ -165,16 +175,17 @@ def empty_COG(profile,rasterio_env_options=None,mask=False):
                 #tifffile gave warnings if editing offsets and bytes at once. so opening and closing the file to avoid this
                 memfileio.seek(0)
                 with tifffile.TiffFile(memfileio) as tif:
-                    tif.pages[p].tags['ImageWidth'].overwrite(w,dtype='I')
-                    tif.pages[p].tags['ImageLength'].overwrite(h,dtype='I')
+                    tif.pages[p].tags['ImageWidth'].overwrite(w,dtype='H' if h < 2**16 else 'I')
+                    tif.pages[p].tags['ImageLength'].overwrite(h,dtype='H' if h < 2**16 else 'I')
                     tif.pages[p].tags['TileOffsets'].overwrite([0]*num_tiles)
                 memfileio.seek(0)
                 with tifffile.TiffFile(memfileio) as tif:
-                    tif.pages[p].tags['TileByteCounts'].overwrite([0]*num_tiles)
+                    #i see no reason for the single tile long8 dtype but its what gdal does and matching it makes testing easier
+                    tif.pages[p].tags['TileByteCounts'].overwrite([0]*num_tiles,dtype='Q' if num_tiles == 1 else 'I')
             h =max(1,h//2)
             w =max(1,w//2)
         memfileio.seek(0)
-        if not profile["COG_ghost_data"]:
+        if not profile["cog_ghost_data"]:
             delete_COG_ghost_header(memfileio)
         memfileio.seek(0)
         data_fixed = memfileio.read()
@@ -287,13 +298,13 @@ def partial_COG_maker(
             for offset, bytecount in zip(databyteoffsets.ravel(), databytecounts.ravel()):
                 new_databyteoffsets.append(current_offset) #sparse values get reset to zero later
                 if bytecount:
-                    if profile["COG_ghost_data"]:
+                    if profile["cog_ghost_data"]:
                         part_bytes.extend(bytecount.tobytes())
                         current_offset += 4
                     _ = memfile.seek(offset)
                     part_bytes.extend(memfile.read(bytecount))
                     current_offset += bytecount
-                    if profile["COG_ghost_data"]:
+                    if profile["cog_ghost_data"]:
                         part_bytes.extend(part_bytes[-4:])
                         current_offset += 4
     
