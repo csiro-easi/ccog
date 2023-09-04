@@ -269,22 +269,22 @@ def partial_COG_maker(
                 if profile['compress'] == 'jpeg':
                     test_jpegtables(page.tags['JPEGTables'].value,profile,rasterio_env_options)
                 
-                #always make mask data ignore it later if not needed
-                tile_dims_count = (2,math.ceil(page.imagelength/page.tilelength),math.ceil(page.imagewidth/page.tilewidth))  
+                #always make mask data ignore it later if not needed. dim order to interleave data and mask.
+                tile_dims_count = (math.ceil(page.imagelength/page.tilelength),math.ceil(page.imagewidth/page.tilewidth),2)  
                 databytecounts = np.zeros(tile_dims_count,dtype=np.int32)
-                databytecounts[0,:,:] = np.reshape(page.databytecounts,tile_dims_count[-2:])
+                databytecounts[:,:,0] = np.reshape(page.databytecounts,tile_dims_count[:2])
                 databyteoffsets = np.zeros(tile_dims_count,dtype=np.int64)
-                databyteoffsets[0,:,:] = np.reshape(page.dataoffsets,tile_dims_count[-2:])
+                databyteoffsets[:,:,0] = np.reshape(page.dataoffsets,tile_dims_count[:2])
                 if mask:
                     mask_page = tif.pages[1]
-                    databytecounts[1,:,:] = np.reshape(mask_page.databytecounts,tile_dims_count[-2:])
-                    databyteoffsets[1,:,:] = np.reshape(mask_page.dataoffsets,tile_dims_count[-2:])
+                    databytecounts[:,:,1] = np.reshape(mask_page.databytecounts,tile_dims_count[:2])
+                    databyteoffsets[:,:,1] = np.reshape(mask_page.dataoffsets,tile_dims_count[:2])
             
             new_databyteoffsets = []
             current_offset = 0
             part_bytes = bytearray()
-            #ravel with 'f' order to interleave data and mask. Collect up bytes and optional gdal leading and trailing ghosts
-            for offset, bytecount in zip(databyteoffsets.ravel('f'), databytecounts.ravel('f')):
+            #Collect up bytes and optional gdal leading and trailing ghosts
+            for offset, bytecount in zip(databyteoffsets.ravel(), databytecounts.ravel()):
                 new_databyteoffsets.append(current_offset) #sparse values get reset to zero later
                 if bytecount:
                     if profile["COG_ghost_data"]:
@@ -296,8 +296,10 @@ def partial_COG_maker(
                     if profile["COG_ghost_data"]:
                         part_bytes.extend(part_bytes[-4:])
                         current_offset += 4
-                    
-    databyteoffsets = np.reshape(new_databyteoffsets,tile_dims_count,order='f')
+    
+    #moveaxis to un interleave the 
+    databyteoffsets = np.moveaxis(np.reshape(new_databyteoffsets,tile_dims_count),-1, 0)
+    databytecounts = np.moveaxis(databytecounts,-1, 0)
     part_info = (databyteoffsets, databytecounts,len(part_bytes))
     return overview_arr,mask_overview_arr,bytes(part_bytes),part_info
 
