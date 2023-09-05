@@ -201,7 +201,7 @@ def _empty_COG(
                 memfileio.seek(0)
                 with tifffile.TiffFile(memfileio) as tif:
                     tif.pages[p].tags["ImageWidth"].overwrite(
-                        w, dtype="H" if h < 2**16 else "I"
+                        w, dtype="H" if w < 2**16 else "I"
                     )
                     tif.pages[p].tags["ImageLength"].overwrite(
                         h, dtype="H" if h < 2**16 else "I"
