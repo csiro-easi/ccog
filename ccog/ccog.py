@@ -809,6 +809,7 @@ def write_ccog(
     profile["count"] = arr.shape[0]
     profile["height"] = arr.shape[1]
     profile["width"] = arr.shape[2]
+    profile["dtype"] = arr.dtype.name
 
     # mask - check
     if mask is not None:
