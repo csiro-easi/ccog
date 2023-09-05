@@ -143,7 +143,7 @@ def empty_COG(profile,rasterio_env_options=None,mask=False):
                 tif.pages[p.index].tags['TileOffsets'].overwrite([0])
 
                 if 'MASK' in str(p.tags.get('NewSubfileType','')):
-                    main_page_ids.append(p.index)
+                    mask_page_ids.append(p.index)
                 else:
                     main_page_ids.append(p.index)
         #truncate file to get rid of old offsets and counts data
@@ -151,7 +151,7 @@ def empty_COG(profile,rasterio_env_options=None,mask=False):
             memfileio.truncate(min(trash_offsets))
         h = profile['height']
         w = profile['width']
-        for main_and_mask in zip_longest(main_page_ids,main_page_ids):
+        for main_and_mask in zip_longest(main_page_ids,mask_page_ids):
             num_tiles = math.ceil(h/profile["blocksize"])*math.ceil(w/profile["blocksize"])
             for p in main_and_mask:
                 #interleaving the main and mask offsets/bytecounts
@@ -215,8 +215,7 @@ def test_jpegtables(JPEGTables,profile,rasterio_env_options=None):
 
 def partial_COG_maker(
     arr,
-    mask=None,
-    *,
+    mask,
     profile,
     rasterio_env_options,
 ):
@@ -247,15 +246,14 @@ def partial_COG_maker(
             with memfile.open(**profile) as src:
                 src.write(arr)
                 del arr  # reducing mem footprint
-                if mask:
+                if mask is not None:
                     src.write_mask(mask)
-                    del mask
             
             if profile["overview_count"]:
                 with memfile.open(overview_level=0) as src:
                     # get the required overview back as an array
                     overview_arr = src.read()
-                    if mask:
+                    if mask is not None:
                         #mask is the same for all bands
                         mask_overview_arr = src.read_masks(1)
 
@@ -272,7 +270,7 @@ def partial_COG_maker(
                 databytecounts[:,:,0] = np.reshape(page.databytecounts,tile_dims_count[:2])
                 databyteoffsets = np.zeros(tile_dims_count,dtype=np.int64)
                 databyteoffsets[:,:,0] = np.reshape(page.dataoffsets,tile_dims_count[:2])
-                if mask:
+                if mask is not None:
                     mask_page = tif.pages[1]
                     databytecounts[:,:,1] = np.reshape(mask_page.databytecounts,tile_dims_count[:2])
                     databyteoffsets[:,:,1] = np.reshape(mask_page.dataoffsets,tile_dims_count[:2])
@@ -282,17 +280,21 @@ def partial_COG_maker(
             part_bytes = bytearray()
             #Collect up bytes and optional gdal leading and trailing ghosts
             for offset, bytecount in zip(databyteoffsets.ravel(), databytecounts.ravel()):
-                new_databyteoffsets.append(current_offset) #sparse values get reset to zero later
                 if bytecount:
                     if profile["cog_ghost_data"]:
                         part_bytes.extend(bytecount.tobytes())
                         current_offset += 4
+                    
+                    new_databyteoffsets.append(current_offset)
                     _ = memfile.seek(offset)
                     part_bytes.extend(memfile.read(bytecount))
                     current_offset += bytecount
+                    
                     if profile["cog_ghost_data"]:
                         part_bytes.extend(part_bytes[-4:])
                         current_offset += 4
+                else:
+                    new_databyteoffsets.append(0) #sparse values
     
     #moveaxis to un interleave the 
     databyteoffsets = np.moveaxis(np.reshape(new_databyteoffsets,tile_dims_count),-1, 0)
@@ -347,17 +349,15 @@ def COG_graph_builder(da,mask,profile,rasterio_env_options):
         #this is the slowest line by far. if not optimize_graph its faster but slower overall.
         #if optimize_graph=True then the graph ends up reading in the source data many times
         #if optimize_graph=False then the data is read more optimally but the building of the graph gets slower.
-        data_del = da.to_delayed(optimize_graph=False)
+        data_del = da.to_delayed(optimize_graph=False).ravel()
         res_arr = np.ndarray((len(chunk_heights),len(chunk_widths)), dtype=object)
         
-        if mask:
-            mask_del = mask.to_delayed(optimize_graph=False)
-            data_del = zip(data_del.ravel(),mask_del.ravel())
+        mask_del = []
+        if mask is not None:
+            mask_del = mask.to_delayed(optimize_graph=False).ravel()
             mask_res_arr = np.ndarray((len(chunk_heights),len(chunk_widths)), dtype=object)
-        else:
-            data_del = zip(data_del.ravel())
 
-        for blk in data_del:
+        for blk in zip_longest(data_del,mask_del):
             ind = blk[0].key[1:][-2:]
             overview_arr,mask_arr,part_bytes,part_info = tif_part_maker_func(*blk, profile=current_level_profile,rasterio_env_options=del_rasterio_env_options)
             parts_info[level].append((ind,part_info))
@@ -368,19 +368,19 @@ def COG_graph_builder(da,mask,profile,rasterio_env_options):
             if len([1 for s,i in zip(res_arr.shape[-2:],ind) if i<s])==2:
                 blk_final_shape = (chunk_depth[0],max(1,chunk_heights[ind[0]] // 2),max(1,chunk_widths[ind[1]] // 2))
                 res_arr[ind] = dask.array.from_delayed(overview_arr, shape=blk_final_shape, dtype=da.dtype)
-                if mask:
-                    mask_res_arr[ind] = dask.array.from_delayed(mask_arr, shape=blk_final_shape, dtype=mask.dtype)
+                if mask is not None:
+                    mask_res_arr[ind] = dask.array.from_delayed(mask_arr, shape=blk_final_shape[-2:], dtype=mask.dtype)
 
         da = dask.array.block(res_arr.tolist())
         #copy the chunking from the initial data - assuming the first chunk is indicative of appropriate chunking to use for overviews
         da = da.rechunk(chunks= (chunk_depth[0],chunk_heights[0], chunk_widths[0]))
-        if mask:
+        if mask is not None:
             mask = dask.array.block(mask_res_arr.tolist())
             mask = mask.rechunk(chunks= (chunk_heights[0], chunk_widths[0]))
         
         current_level_profile = del_overview_profile
 
-    header_bytes_final = dask.delayed(prep_tiff_header)(parts_info,del_profile,del_rasterio_env_options)
+    header_bytes_final = dask.delayed(prep_tiff_header)(parts_info,del_profile,del_rasterio_env_options,mask = mask is not None)
     #sum as a shorthand for flattening a list in the right order
     delayed_parts = sum([v for k,v in sorted(parts_bytes.items(), reverse=True)],[header_bytes_final])
     return delayed_parts
@@ -453,11 +453,11 @@ def ifd_offset_adjustments(header_length,parts_info):
     #reverse as the header pages are in reverse order
     return (block_offsets[::-1], block_counts[::-1]),(mask_offsets[::-1], mask_counts[::-1])
                               
-def prep_tiff_header(parts_info,del_profile,rasterio_env_options):
+def prep_tiff_header(parts_info,del_profile,rasterio_env_options,mask):
     '''update the header
     '''                  
     #empty_COG is slow for large COGs, its seperate here so dask can run it early
-    header_bytes = empty_COG(del_profile, rasterio_env_options=rasterio_env_options)
+    header_bytes = empty_COG(del_profile, rasterio_env_options=rasterio_env_options,mask = mask)
     #adjust the block data
     #print (parts_info)
     block_data,mask_data = ifd_offset_adjustments(len(header_bytes),parts_info)
@@ -469,7 +469,7 @@ def prep_tiff_header(parts_info,del_profile,rasterio_env_options):
         header_data = memfile.getvalue()
     return header_data
     
-def write_ccog(arr, store=None, mask=None, COG_creation_options = None, rasterio_env_options = None, storage_options = None):
+def write_ccog(arr, mask=None,*, store = None, COG_creation_options = None, rasterio_env_options = None, storage_options = None):
     '''writes a concatenated COG to S3
     arr a dask or xarray array.
         notes on chunking:
@@ -571,7 +571,7 @@ def write_ccog(arr, store=None, mask=None, COG_creation_options = None, rasterio
             raise TypeError (' mask must be an instance of xarray DataArray or dask Array')
         if isinstance(mask,xarray.core.dataarray.DataArray):
             mask = mask.data
-        if arr.chunks[-2] != mask.data.chunks:
+        if arr.chunks[-2:] != mask.chunks:
             raise ValueError ('mask spatial chunks needs to match those of arr')
         #todo: also check CRS and transform match
     
