@@ -25,7 +25,7 @@ required_rasterio_env_options = dict(
 required_creation_options = dict(
     driver="cog",
     bigtiff="yes",
-    num_threads="all_cpus",  # TODO: test what difference this makes if any on a dask cluster
+    #num_threads="all_cpus",  # TODO: test what difference this makes if any on a dask cluster
     tiled="yes",  # only needed if switching to use the Gtiff driver
     overviews="auto",
 )
@@ -34,7 +34,6 @@ default_creation_options = dict(
     sparse_ok=True,
     geotiff_version=1.1,  # why not use the latest by default
     blocksize=512,
-    overview_resampling=rasterio.enums.Resampling.nearest,
     compress=None,
     cog_ghost_data=False,
 )
