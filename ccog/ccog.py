@@ -437,7 +437,24 @@ def _adjust_compression(profile: Dict) -> None:
         if k1 in profile:
             profile[k2] = profile[k1]
 
+def _chunk_adjuster(arr,min_chunk_dim = 12):
+    '''
+    analyse chunks and combine edge chunks in some limited cases
+    
+    this needs to be done so that overlaps can done for resampling
+    
+    the default of 12 is based on analysis of the resampling in gdal and that is the largest radius of edge effects
+    '''
+    chunk_depth,chunk_heights,chunk_widths = dask_arr.chunks
+    #merge the second to last chunks if too small
+    if len(chunk_heights) > 1 and chunk_heights[-1] <= min_chunk_dim:
+        chunk_heights = (*chunk_heights[:-2],sum(chunk_heights[-2:]))
+    if len(chunk_widths) > 1 and chunk_widths[-1] <= min_chunk_dim:
+        chunk_widths = (*chunk_widths[:-2],sum(chunk_widths[-2:]))
+    arr = arr.rechunk(chunks=(chunk_depth,chunk_heights,chunk_widths))
+    return arr
 
+            
 def _COG_graph_builder(
     arr: da.Array,
     mask: Optional[da.Array],
@@ -460,7 +477,9 @@ def _COG_graph_builder(
         dask.delayed: A Dask delayed object representing the computation graph to build the COG.
     """
     tif_part_maker_func = dask.delayed(_partial_COG_maker, nout=4)
-
+    
+    arr = _chunk_adjuster(arr)
+    
     # ensure the overview count is set
     profile["overview_count"] = _get_maximum_overview_level(
         profile["width"],
@@ -700,7 +719,12 @@ def write_ccog(
 ) -> Delayed:
     """Creates a dask graph that when computed produces a concatenated COG either as bytes or written to S3.
     
-    if arr chunks are full width OR there height equals profile['blocksize'] then the GDAL COG ghost optimisations are retained
+    If arr chunks are full width OR there height equals profile['blocksize'] then the GDAL COG ghost optimisations are retained
+    
+    COG_creation_options can include most of the creation options specified here:
+    https://gdal.org/drivers/raster/cog.html
+    For resampling values of NEAREST/AVERAGE/MODE/RMS will result in a simpler dask graph and work faster and therfore should be prefered.
+    Values of BILINEAR/CUBIC/CUBICSPLINE/LANCZOS use a more complex graph to avoid edge effects.
 
     Args:
         arr (Union[da.Array, xarray.DataArray]): The data array to write as a COG. It can be a dask array or xarray DataArray.
