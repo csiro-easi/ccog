@@ -1,111 +1,57 @@
-__all__ = ['write_ccog']
+__all__ = ["write_ccog"]
 
-from contextlib import suppress
-from itertools import count
 import io
-import struct
-import xml.etree.ElementTree as ET
-import numpy as np
-import xarray
-import dask
-from distributed import get_client
-from dask.base import tokenize
-import rasterio
-from rasterio import shutil #cant see it ifs not imported apparently
-#from rasterio.rio.overview import get_maximum_overview_level
-from affine import Affine
+import math
+from itertools import zip_longest
+from typing import Dict, List, Optional, Tuple, Union
 
+import dask
+import dask.array as da
+import numpy as np
+import rasterio
+import rioxarray
 import tifffile
+import xarray
+# from rasterio.rio.overview import get_maximum_overview_level
+from affine import Affine
+from dask.delayed import Delayed
 
 from . import aws_tools
 
-# s3 part limit docs https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html
-# actually 1 to 10,000 (inclusive) 
-s3_part_limit = 10000  
-# leaving the first part for the headers
-s3_start_part = 2  
-# 5 MiB - There is no minimum size limit on the last part of your multipart upload.
-s3_min_part_bytes = 5 * 1024 * 1024  
-# 5 GiB
-s3_max_part_bytes = 5 * 1024 * 1024 * 1024  
-# 5 TiB
-s3_max_total_bytes = 5 * 1024 * 1024 * 1024 * 1024 
+required_rasterio_env_options = dict(
+    gdal_tiff_internal_mask=True
+)  # only needed if switching to use the Gtiff driver
 
 required_creation_options = dict(
-    sparse_ok=True,
-    driver="COG",
-    bigtiff="YES",
-    num_threads="all_cpus",
-    overviews="AUTO",
+    driver="cog",
+    bigtiff="yes",
+    num_threads="all_cpus",  # TODO: test what difference this makes if any on a dask cluster
+    tiled="yes",  # only needed if switching to use the Gtiff driver
+    overviews="auto",
 )
 
 default_creation_options = dict(
-    geotiff_version= 1.1, #why not use the latest by default
-    blocksize = 512,
-    overview_resampling = rasterio.enums.Resampling.nearest,
-
+    sparse_ok=True,
+    geotiff_version=1.1,  # why not use the latest by default
+    blocksize=512,
+    overview_resampling=rasterio.enums.Resampling.nearest,
+    compress=None,
+    cog_ghost_data=False,
 )
 
-#thoughts around how to
-# break a COG down to good sized chunks
-#
-# its a balance between:
-# s3 multipart upload limits minimum size of 5MiB per part (note total combined maximum size of 5TiB)
-# and maximum of 10,000 parts
-# bigger parts get more overviews calculated and therefore less data needs to be transfured to do courser overview creation
-# spreading the load between dask workers/threads - ideally 1 or a few parts per thread.
-# not overloading worker memory
-# working with source data chunks - cant really adjust for this as the COG output tile/overview structure is very strict.
-# chunks MUST be aligned to one of the overview levels
-# Therefore, I think the goal is big chunks that dont overload memory.
-# in the place of automatically analysing the specs of the cluster tune for a typical cluster worker
-# For a small array on a big cluster this may leave some workers idle. so be it.
 
-
-#related links/projects
-#cog standard https://portal.ogc.org/files/102116?utm_source=phplist879&utm_medium=email&utm_content=HTML&utm_campaign=OGC+seeks+public+comment+on+Cloud+Optimized+GeoTIFF+%28COG%29+Standard
-#https://pypi.org/project/large-image-converter/
-#interesting tequnique for partially updateing a s3 key https://stackoverflow.com/questions/38069985/replacing-bytes-of-an-uploaded-file-in-amazon-s3
-#cogger https://github.com/airbusgeo/cogger
-#rioxarray
-#https://pypi.org/project/tifftools/
-#https://github.com/cgohlke/tifffile
-#a timely warning about s3 costs https://pancho.dev/posts/watch_out_cloud_storage/
-#many others
-
-#waiting on gdal 3.6
-#it allows my to force creation of overview levels beyond what is needed for normal users
-#it fixed a writing bug i identified for long thin COGs
-#however for now as long as the input data fills full sized chunks at the level used then ccog should work fine
-
-#not tested with
-# more then 1 band
-# with masks
-# dtypes other then float32
-#different copressions schemes - shouldnt be any issue
-# a range of resample types - some resampling types may not transistion well between the finer levels and the course levels.
-#various nodata values - handling of nodata is a bit haphazard - should work with np.nan
-#different compression for different tiff pages
-
-#interesting things to consider
-#  multi multi part upload !! https://en.wikipedia.org/wiki/Epizeuxis
-#- multipart upload to s3 is limited to 10000 parts. to get around this parts can be put into multiple temp files on s3 and then
-#     a new multipart file is produced and s3.upload_part_copy can be used to assemble the temp files
-# - a similar approach could be used to rearrange a ccog file into a stricter cog format. as a post processign step.
-#    care would need to be taken to not cross the min/max part size limits
-#    max could be avoided jsut by splitting a part
-#    min could be avoided by downloading enough small bits locally to be able to provide a 50MiB part and then upload_part.
-
-def get_maximum_overview_level(width, height, minsize=256):
+def _get_maximum_overview_level(
+    width: int, height: int, minsize: int = 256, overview_count: Optional[int] = None
+) -> int:
     """
-    Based on rasterio.rio.overview.get_maximum_overview_level
-    modified to match the behaviour of the gdal COG driver
-    so that the smallest overview is smaller than `minsize` in BOTH width and height.
-    
-    
     Calculate the maximum overview level of a dataset at which
     the smallest overview is smaller than `minsize`.
-    Attributes
+
+    Based on rasterio.rio.overview.get_maximum_overview_level
+    modified to match the behavior of the gdal COG driver
+    so that the smallest overview is smaller than `minsize` in BOTH width and height.
+
+    Parameters:
     ----------
     width : int
         Width of the dataset.
@@ -113,475 +59,778 @@ def get_maximum_overview_level(width, height, minsize=256):
         Height of the dataset.
     minsize : int (default: 256)
         Minimum overview size.
-    Returns
+    overview_count: Optional[int] (default: None)
+        The maximum overview level to generate.
+
+    Returns:
     -------
     overview_level: int
-        overview level.
+        Overview level.
     """
+    # note GDAL seems to have a limit of an overview level of 30
+
+    # GDAL will keep producing overviews for single pixel strands of data longer then blocksize.
+    # this is a bit odd because the resampling doesnt make sense
+
     overview_level = 0
     overview_factor = 1
-    while max(width // overview_factor, height // overview_factor) > minsize:
-        overview_factor *= 2
-        overview_level += 1
+    if overview_count is not None:
+        while (
+            overview_count > overview_level
+            and max(width // overview_factor, height // overview_factor) > 1
+        ):
+            overview_factor *= 2
+            overview_level += 1
+            # print (width // overview_factor, height // overview_factor)
+    else:
+        while max(width // overview_factor, height // overview_factor) > minsize:
+            overview_factor *= 2
+            overview_level += 1
 
     return overview_level
 
-def xarray_to_profile(x_arr):
-    profile = dict(        
-        dtype = x_arr.dtype.name,
-        width = x_arr.rio.width,
-        height = x_arr.rio.height,
-        transform = x_arr.rio.transform(),
-        crs = x_arr.rio.crs,
-        nodata = x_arr.rio.nodata,
-        count = x_arr.rio.count,
-    )
-    return profile
 
-def empty_single_band_vrt(**profile):
-    """Make a VRT XML document.
-
-    This is a very simple vrt with no datasets.
-
-    Its used as a starting point to create an empty COG file
-
-
-
-
-    Parameters
-    ----------
-    Returns
-    -------
-    str
-        An XML text string.
+def _empty_COG(
+    profile: dict,
+    rasterio_env_options: Optional[Dict] = None,
+    mask: Optional[bool] = False,
+) -> bytes:
     """
-    #         Implementation notes:
-    #     A COG can only be created with the gdal COG driver by copying an existing dataset
-    #     Note that rasterio seems to hide this in the background but also seems to 
-    #     break the handling of nodata in sparse COGs if you never write to them.
-    #     The method used here is also faster than getting rasterio to produce an empty COG from scratch.
+    Makes an empty sparse COG in memory.
 
-    #     The existing dataset doesnt need to be a VRT but experimentation has shown that this VRT
-    #     is faster then the other empty datasets Ive tried as starting points.
-    #     Of particular benefit is the inclusion of an OverviewList and then using the COG driver
-    #     option of OVERVIEWS = 'FORCE_USE_EXISTING'
-    #     It seems that building overviews, even if empty and sparse is the slow part of making a COG.
-
-    #     An alternative approach to produce the vrt xml written in this code
-    #     is to use a dummy dataset and BuildVRT and then
-    #     build_overviews with VRT_VIRTUAL_OVERVIEWS = 'YES'and then editing the VRT to remove the dummy dataset
-    #     The code below produces an output identical to the above steps but this implementation 
-    #     is prefered as it is more direct and hopefully clearer
-    
-    overview_level = get_maximum_overview_level(profile['width'], profile['height'], minsize=profile['blocksize'])
-    overviews = " ".join([str(2**j) for j in range(1, overview_level + 1)])
-
-    # based on code in rasterio https://github.com/rasterio/rasterio/blob/main/rasterio/vrt.py
-    vrtdataset = ET.Element("VRTDataset")
-    vrtdataset.attrib["rasterXSize"] = str(profile['width'])
-    vrtdataset.attrib["rasterYSize"] = str(profile['height'])
-    srs = ET.SubElement(vrtdataset, "SRS")
-    srs.text = profile['crs'].wkt if 'crs' in profile else ""
-    geotransform = ET.SubElement(vrtdataset, "GeoTransform")
-    geotransform.text = ",".join([str(v) for v in profile['transform'].to_gdal()])
-    
-    vrtrasterband = ET.SubElement(vrtdataset, "VRTRasterBand")
-    vrtrasterband.attrib["dataType"] = rasterio.dtypes._gdal_typename(profile['dtype'])
-    vrtrasterband.attrib["band"] = str(1)
-    vrtrasterband.attrib["blockXSize"] = str(profile['blocksize'])
-    vrtrasterband.attrib["blockYSize"] = str(profile['blocksize'])
-    if 'nodata' in profile:
-        nodatavalue = ET.SubElement(vrtrasterband, "NoDataValue")
-        nodatavalue.text = str(profile['nodata'])
-    OverviewList = ET.SubElement(vrtdataset, "OverviewList")
-    OverviewList.attrib["resampling"] = profile['overview_resampling'].name.upper()
-    OverviewList.text = overviews
-    return ET.tostring(vrtdataset).decode("ascii")
-
-def empty_single_band_COG(profile,rasterio_env_options=None):
-    """
-    makes an empty sparse COG in memory
-
-    used as a reference to look at the structure of a COG file
+    Used as a reference to look at the structure of a COG file
     and as the starting point for some file format fiddling.
 
-    returns bytes
-    """
-    rasterio_env_options = {} if rasterio_env_options is None else rasterio_env_options
-    #this is applied elsewhere but apply here for when testing
-    profile.update(required_creation_options)
-       
-    vrt = empty_single_band_vrt(**profile)
+    Faster than doing this directly with rasterio.
 
-    with rasterio.Env(**rasterio_env_options):
-        with rasterio.io.MemoryFile() as memfile:
-            memfile = rasterio.io.MemoryFile()
-            rasterio.shutil.copy(
-                vrt,
-                memfile.name,
-                **profile
-            )
-            memfile.seek(0)
-            data = memfile.read()
-    return data
-
-def partial_COG_maker(
-    arr,
-    writeLastOverview,
-    profile,
-    rasterio_env_options,
-):
-    """
-    writes arr to a in memory COG file and the pulls the COG file apart and returns it in parts that are useful for
-    reconstituting it differently.
-    Gets all the advantages of GDALs work writing the file so dont need to do that work from scratch.
-    writeLastOverview If False the last overview is not included in imagedata ,TileOffsets, TileByteCounts
-
-    """
-    profile = profile.copy() #careful not to update in place
-    profile['height']= arr.shape[0]
-    profile['width']= arr.shape[1]
-    #not using the transform in profile as its going to be wrong - make it obviously wrong avoids rasterio warnings
-    profile['transform']= Affine.scale(2)
+    Output should match the output from this code:
 
     with rasterio.Env(**rasterio_env_options):
         with rasterio.io.MemoryFile() as memfile:
             with memfile.open(**profile) as src:
-                src.write(arr, 1)
-                del arr  # reducing mem footprint
-                
-                #gdal <3.6 doesnt understand "overview_count" so 
-                #forcing overview building for the number of levels needed
-                #next  2 lines can likely be removed if support is limited to gdal >= 3.6
-                factors = [2**j for j in range(1, profile['overview_count'] + 1)]
-                src.build_overviews(factors, profile['overview_resampling'])
-
-            with memfile.open(overview_level=profile['overview_count'] - 1) as src:
-                # get the required overview back as an array
-                outarr = src.read(1)
- 
+                pass
             memfile.seek(0)
+            data_rio = memfile.read()
 
-            #gdal/rasterio dont make it easy to access and manipulate offsets and counts tifffile does :-)
-            lim = None if writeLastOverview else profile['overview_count']
-            with tifffile.TiffFile(memfile) as tif:
-                TileOffsets = [page.tags['TileOffsets'].value for page in tif.pages[0:lim]]
-                TileByteCounts = [page.tags['TileByteCounts'].value for page in tif.pages[0:lim]]
+    Note: it very slightly differs in some cases (where the ifd length isn't divisible by 2 - jpeg compressing seems to have this issue)
+    where tifffile and gdal layout 1 byte differently.
 
-            # assume the very strict COG layout from GDAL get the image data for all except the highest overview
-            # keep the gdal ghost leader - not sure its going to be much use but all the other tiles will have it so keep it for the first one to be consistant
-            #keeping it also maintains the offset of '0' as having special meaning
-            gdal_ghost_offset = 4
-            # find the offset to the first tile of image data
-            pos_offsets = [i for l in TileOffsets for i in l if i > 0]  
-            imagedata = b''
-            if len(pos_offsets) > 0:
-                # its not all nodata
-                image_offset = min(pos_offsets) - gdal_ghost_offset
-                TileOffsets = [[v - image_offset if v else 0 for v in l] for l in TileOffsets]
-                memfile.seek(image_offset)
-                imagedata = memfile.read()
+    Parameters:
+    ----------
+    profile : dict
+        The profile for the COG.
+    rasterio_env_options : Optional[Dict], (default: None)
+        Additional options for the rasterio environment.
+    mask : bool, optional
+        Whether to use a mask, by default False.
 
-            # offsets and counts will be more useful as 2d numpy arrays
-            # level -1 is the full res data - also accessed with overview_level=None
-            for ov in range(len(TileOffsets)):
-                with memfile.open(overview_level=ov - 1) as src:
-                    last_window_indicies = list(src.block_windows(-1))[-1][0]
-                    blocks_shp = (last_window_indicies[0]+1,last_window_indicies[1]+1)
-                    TileOffsets[ov] = np.array(TileOffsets[ov], dtype=np.int64).reshape(blocks_shp)
-                    TileByteCounts[ov] = np.array(TileByteCounts[ov], dtype=np.int64).reshape(blocks_shp)
+    Returns:
+    -------
+    bytes
+        The bytes representing the COG.
+    """
+    # This simply works by calling gdal with rasterio and not writing any data
+    # however for large datasets this can be quite slow.
+    # so the size of the dataset is reduced so that it still creates all the required overview
+    # then tifffile is used to massage the file to the correct dimensions.
 
-    return (outarr, TileOffsets, TileByteCounts, imagedata)
+    rasterio_env_options = {} if rasterio_env_options is None else rasterio_env_options
 
-def tif_part_writer(
-    block, i, mpu_store, writeLastOverview, pad, profile, rasterio_env_options,
-):
-    
-    outarr, TileOffsets, TileByteCounts, imagedata = partial_COG_maker(
-        block, writeLastOverview=writeLastOverview, profile=profile, rasterio_env_options=rasterio_env_options,
-    )
-    #only make a part if there is data in the part
-    part = None
-    if len(imagedata):
-        if pad:
-            # extend the file so that imagedata is at least pad bytes long due to s3 minimum file size
-            imagedata = imagedata.ljust(pad, b"\0")
-        assert len(imagedata) <= s3_max_part_bytes , 'part too big for s3 part upload'
-        part = mpu_store.upload_part_mpu(i, imagedata)
+    prof = profile.copy()
+    # Note that gdal has an issue that throws an error if dim is over blocksize and overview_count is zero
+    prof["height"] = 2 ** profile["overview_count"]
+    prof["width"] = 1
 
-    data_len = len(imagedata)
-    #print (i,writeLastOverview,profile)
-    return outarr, (part, data_len, TileOffsets, TileByteCounts)
+    with rasterio.Env(**rasterio_env_options):
+        with rasterio.io.MemoryFile() as memfile:
+            # print (prof)
+            with memfile.open(**prof) as src:
+                if "colormap" in profile:
+                    src.write_colormap(1, profile["colormap"])
+                if mask:
+                    src.write_mask(False)
+                # todo include tags,scale,offset,desctription,units etc
+            memfile.seek(0)
+            data = memfile.read()
 
-def modify_COG_ghost_header(memfile):
-    '''If messing with the gdal COG block order optimisations its likely a good idea to let GDAL know about it in the ghost header
+    with io.BytesIO(data) as memfileio:
+        with tifffile.TiffFile(memfileio) as tif:
+            main_page_ids = []
+            mask_page_ids = []
+            trash_offsets = []
+            for p in tif.pages:
+                if (
+                    p.tags["TileOffsets"].valueoffset
+                    > p.tags["TileOffsets"].offset + 12
+                ):
+                    trash_offsets.append(p.tags["TileOffsets"].valueoffset)
+                # adjust for gdal cog ghost leader
+                trash_offsets.extend(
+                    v - 4 for v in p.tags["TileOffsets"].value if v != 0
+                )
+                if (
+                    p.tags["TileByteCounts"].valueoffset
+                    > p.tags["TileByteCounts"].offset + 12
+                ):
+                    trash_offsets.append(p.tags["TileByteCounts"].valueoffset)
+
+                tif.pages[p.index].tags["ImageWidth"].overwrite(1)
+                tif.pages[p.index].tags["ImageLength"].overwrite(1)
+                tif.pages[p.index].tags["TileByteCounts"].overwrite([0])
+                tif.pages[p.index].tags["TileOffsets"].overwrite([0])
+
+                if "MASK" in str(p.tags.get("NewSubfileType", "")):
+                    mask_page_ids.append(p.index)
+                else:
+                    main_page_ids.append(p.index)
+        # truncate file to get rid of old offsets and counts data
+        if trash_offsets:
+            memfileio.truncate(min(trash_offsets))
+        h = profile["height"]
+        w = profile["width"]
+        for main_and_mask in zip_longest(main_page_ids, mask_page_ids):
+            num_tiles = math.ceil(h / profile["blocksize"]) * math.ceil(
+                w / profile["blocksize"]
+            )
+            for p in main_and_mask:
+                # interleaving the main and mask offsets/bytecounts
+                if p is None:
+                    # no mask
+                    continue
+                # tifffile gave warnings if editing offsets and bytes at once. so opening and closing the file to avoid this
+                memfileio.seek(0)
+                with tifffile.TiffFile(memfileio) as tif:
+                    tif.pages[p].tags["ImageWidth"].overwrite(
+                        w, dtype="H" if w < 2**16 else "I"
+                    )
+                    tif.pages[p].tags["ImageLength"].overwrite(
+                        h, dtype="H" if h < 2**16 else "I"
+                    )
+                    tif.pages[p].tags["TileOffsets"].overwrite([0] * num_tiles)
+                memfileio.seek(0)
+                with tifffile.TiffFile(memfileio) as tif:
+                    # i see no reason for the single tile long8 dtype but its what gdal does and matching it makes testing easier
+                    tif.pages[p].tags["TileByteCounts"].overwrite(
+                        [0] * num_tiles, dtype="Q" if num_tiles == 1 else "I"
+                    )
+            h = max(1, h // 2)
+            w = max(1, w // 2)
+        memfileio.seek(0)
+        if not profile["cog_ghost_data"]:
+            _delete_COG_ghost_header(memfileio)
+        memfileio.seek(0)
+        data_fixed = memfileio.read()
+    return data_fixed
+
+
+def _delete_COG_ghost_header(memfile: io.BytesIO):
+    """Delete the COG ghost header from a memory file.
+
+    If messing with the gdal COG block order optimisations its likely a good idea to let GDAL know about it in the ghost header
     its a little annoying to have to fully switch off the optimisations as its still 'mostly' got all the optimisations in place
-    Ive not tested what GDAL does if if I dont switch off this optimisation. 
-    I would hope that it has some sanity checks that stop to deal with blocks that are out of order and doesnt try and read massive amounts of data for getting a small tile?
-    quick and dirty way to do it but assumes this structure isnt likely to change and if it does and breaks this code then likely other assumptions need fixing.
-    todo: ask gdal maintainers about doing this and its impacts.
-    '''
+    Ive not tested what GDAL does if if I dont switch off this optimisation.
+    GDAL complains if I only modify the header so im removing it fully. Leaving the space as its only a few hundred bytes.
+
+    Args:
+    memfile (io.BytesIO): The memory file containing the COG.
+
+    Returns:
+    None
+    """
     assert not memfile.closed, "memory file was closed before writing"
-    memfile.seek(83)
-    assert memfile.read(21) == b'BLOCK_ORDER=ROW_MAJOR' , 'oh no gdal COG format changed'
-    memfile.seek(83)
-    memfile.write(b'BLOCK_ORDER=CCOG     ')#trailing space intentional - ive just made CCOG up - wonder if GDAL will even notice
-    memfile.seek(168)
-    assert memfile.read(31) == b'KNOWN_INCOMPATIBLE_EDITION=NO\n ' , 'oh no gdal COG format changed'
-    memfile.seek(168)
-    memfile.write(b'KNOWN_INCOMPATIBLE_EDITION=YES\n') #trailing space removed just like gdal would - NOTE: This change will result in GDAL giving warnings
+    memfile.seek(16 + 30)
+    GDAL_STRUCTURAL_METADATA_SIZE = int(memfile.read(6))
+    memfile.seek(16)
+    memfile.write((43 + GDAL_STRUCTURAL_METADATA_SIZE) * b"\0")
     memfile.seek(0)
     return
 
-def chunk_dim(blockSize,chunk_exp):
-    return blockSize * 2 ** chunk_exp
 
-def adjust_compression(profile):
-    '''
-    When writing blocks that are actually all overviews gdal will still think the first level is not overviews
-    so adjust the profile to account for this
-    '''
-    if 'overview_compress' in profile:
-        if profile.get('overview_compress', None) != profile.get('compress', None):
-            for k in ['quality','predictor']:
-                if k in profile:
-                    del profile[k] 
-    for k1,k2 in [('overview_compress','compress'),('overview_quality','quality'),('overview_predictor','predictor'),]:
-        if k1 in profile:
-            profile[k2] = profile[k1] 
+def _test_jpegtables(
+    JPEGTables: bytes, profile: Dict, rasterio_env_options: Optional[Dict] = None
+):
+    """Test if JPEGTables match those of an empty TIFF.
 
-def chunk_adjuster(dask_arr,blockSize,chunk_exp = 0):
-    '''
-    analyse chunks and combine edge chunks in some limited cases
-    '''
-    chunk_heights,chunk_widths = dask_arr.chunks
-    if chunk_exp<1:
-        chunk_exp = get_maximum_overview_level(chunk_widths[0], chunk_heights[0], minsize=blockSize)
-    #assert chunk_exp >= 1, 'chunk_exp too small'
-    #if chunk_exp == 2:
-    #    print('consider using larger chunks') #shift to logging system
-    #get here if there is more then a single chunk
-    #very small last chunks trigger different handling in gdal overview creation
-    #merge the second to last chunks if too small
-    if chunk_heights[-1] < 2**chunk_exp:
-        chunk_heights = (*chunk_heights[:-2],sum(chunk_heights[-2:]))
-    if chunk_widths[-1] < 2**chunk_exp:
-        chunk_widths = (*chunk_widths[:-2],sum(chunk_widths[-2:]))
-    dask_arr = dask_arr.rechunk(chunks=(chunk_heights,chunk_widths))
-    return(dask_arr,chunk_exp)
+    This function compares the JPEGTables of a COG with the JPEGTables of an empty TIFF.
+    If there is a difference, it raises a ValueError.
 
-def nested_graph_builder(da,mpu_store,profile,rasterio_env_options):
+    Args:
+        JPEGTables (bytes): The JPEGTables to test.
+        profile (Dict): The profile of the COG.
+        rasterio_env_options (Optional[Dict], optional): Rasterio environment options. Defaults to None.
+
+    Raises:
+        ValueError: If the JPEGTables are different.
+
+    Returns:
+        None
+    """
     profile = profile.copy()
+    profile["height"] = 512
+    profile["width"] = 512
+    with rasterio.Env(**rasterio_env_options):
+        with rasterio.io.MemoryFile() as memfile:
+            with memfile.open(**profile) as src:
+                pass
+            memfile.seek(0)
+            with tifffile.TiffFile(memfile) as tif:
+                empty_JPEGTables = tif.pages[0].tags["JPEGTables"].value
+    if empty_JPEGTables != JPEGTables:
+        raise ValueError("different JPEGTables")
 
-    parts_info = []
-    # part ids in reverse so higher resolution data is towards the end of the cog
-    mpu_part_id_generator = count(10000,-1)
-    for level in count():
-        if level > 0:
-            adjust_compression(profile)
-        da, chunk_exp = chunk_adjuster(da, profile['blocksize'],chunk_exp = 0)
-        profile["overview_count"] = chunk_exp
 
-        chunk_heights, chunk_widths = da.chunks
-        da_del = da.to_delayed(optimize_graph=False)
-        last = get_maximum_overview_level(chunk_widths[0], chunk_heights[0], minsize=profile['blocksize']) == 0
-        res_arr = np.ndarray(da_del.shape, dtype=object)
-        #flipping as the mpu_part_id_generator decrements the counter
-        for mpu_part_id, blk in zip(mpu_part_id_generator, np.flip(da_del.ravel())):
-            ind = blk.key[1:]
-            blk_final_shape = (
-                chunk_heights[ind[0]] // 2**chunk_exp,
-                chunk_widths[ind[1]] // 2**chunk_exp,
+def _partial_COG_maker(
+    arr: np.ndarray,
+    mask: Optional[np.ndarray],
+    profile: Dict,
+    rasterio_env_options: Optional[Dict],
+) -> Tuple[
+    Optional[np.ndarray],
+    Optional[np.ndarray],
+    bytes,
+    Tuple[np.ndarray, np.ndarray, int],
+]:
+    """
+    Writes 'arr' to an in-memory COG file and then pulls the COG file apart,
+    returning it in parts that are useful for reconstituting it differently.
+
+    This function leverages rasterio/GDAL for writing the file to avoid doing
+    that work from scratch.
+
+    Args:
+        arr (np.ndarray): The array to be written to the COG file.
+        mask (Optional[np.ndarray]): The mask array. Default is None.
+        profile (Dict): The profile of the COG.
+        rasterio_env_options (Optional[Dict]): Rasterio environment options. Default is None.
+
+    Returns:
+        Tuple[Optional[np.ndarray], Optional[np.ndarray], bytes, Tuple[np.ndarray, np.ndarray, int]]:
+        - overview_arr (Optional[np.ndarray]): The overview array.
+        - mask_overview_arr (Optional[np.ndarray]): The overview mask array.
+        - part_bytes (bytes): The bytes containing the COG data.
+        - part_info (Tuple[np.ndarray, np.ndarray, int]): Information about COG parts.
+            - databyteoffsets (np.ndarray): Offset of each data block.
+            - databytecounts (np.ndarray): Count of bytes in each data block.
+            - len(part_bytes) (int): Length of part_bytes.
+    """
+    profile = profile.copy()  # careful not to update in place
+    profile["height"] = arr.shape[1]
+    profile["width"] = arr.shape[2]
+    # not using the transform in profile as its going to be wrong - make it obviously wrong avoids rasterio warnings
+    profile["transform"] = Affine.scale(2)
+    # the overview is only used for resampling its not stored
+    profile["overview_compress"] = "NONE"
+    profile["overview_count"] = 1
+    overview_arr = None
+    mask_overview_arr = None
+    if profile["height"] == 1 and profile["width"] == 1:
+        # stops gdal throwing an error
+        # in the case of a 1x1 pixel input return it as the overview
+        profile["overview_count"] = 0
+        overview_arr = arr
+        mask_overview_arr = mask
+
+    with rasterio.Env(**rasterio_env_options):
+        with rasterio.io.MemoryFile() as memfile:
+            with memfile.open(**profile) as src:
+                src.write(arr)
+                del arr  # reducing mem footprint
+                if mask is not None:
+                    src.write_mask(mask)
+
+            if profile["overview_count"]:
+                with memfile.open(overview_level=0) as src:
+                    # get the required overview back as an array
+                    overview_arr = src.read()
+                    if mask is not None:
+                        # mask is the same for all bands
+                        mask_overview_arr = src.read_masks(1)
+
+            # removing the gdal ghost leaders
+            memfile.seek(0)
+            with tifffile.TiffFile(memfile) as tif:
+                page = tif.pages[0]
+                if profile["compress"] == "jpeg":
+                    _test_jpegtables(
+                        page.tags["JPEGTables"].value, profile, rasterio_env_options
+                    )
+
+                # always make mask data ignore it later if not needed. dim order to interleave data and mask.
+                tile_dims_count = (
+                    math.ceil(page.imagelength / page.tilelength),
+                    math.ceil(page.imagewidth / page.tilewidth),
+                    2,
+                )
+                databytecounts = np.zeros(tile_dims_count, dtype=np.int32)
+                databytecounts[:, :, 0] = np.reshape(
+                    page.databytecounts, tile_dims_count[:2]
+                )
+                databyteoffsets = np.zeros(tile_dims_count, dtype=np.int64)
+                databyteoffsets[:, :, 0] = np.reshape(
+                    page.dataoffsets, tile_dims_count[:2]
+                )
+                if mask is not None:
+                    mask_page = tif.pages[1]
+                    databytecounts[:, :, 1] = np.reshape(
+                        mask_page.databytecounts, tile_dims_count[:2]
+                    )
+                    databyteoffsets[:, :, 1] = np.reshape(
+                        mask_page.dataoffsets, tile_dims_count[:2]
+                    )
+
+            new_databyteoffsets = []
+            current_offset = 0
+            part_bytes = bytearray()
+            # Collect up bytes and optional gdal leading and trailing ghosts
+            for offset, bytecount in zip(
+                databyteoffsets.ravel(), databytecounts.ravel()
+            ):
+                if bytecount:
+                    if profile["cog_ghost_data"]:
+                        part_bytes.extend(bytecount.tobytes())
+                        current_offset += 4
+
+                    new_databyteoffsets.append(current_offset)
+                    _ = memfile.seek(offset)
+                    part_bytes.extend(memfile.read(bytecount))
+                    current_offset += bytecount
+
+                    if profile["cog_ghost_data"]:
+                        part_bytes.extend(part_bytes[-4:])
+                        current_offset += 4
+                else:
+                    new_databyteoffsets.append(0)  # sparse values
+
+    # moveaxis to un interleave the
+    databyteoffsets = np.moveaxis(
+        np.reshape(new_databyteoffsets, tile_dims_count), -1, 0
+    )
+    databytecounts = np.moveaxis(databytecounts, -1, 0)
+    part_info = (databyteoffsets, databytecounts, len(part_bytes))
+    return overview_arr, mask_overview_arr, bytes(part_bytes), part_info
+
+
+def _adjust_compression(profile: Dict) -> None:
+    """
+    Adjusts the compression settings in a profile for GDAL.
+
+    This function modifies the input profile dictionary to ensure that compression settings
+    for overview levels are correctly adjusted. When writing blocks that are actually overviews,
+    GDAL will still think the first level is not an overview, so this function makes sure that
+    the profile accounts for this.
+
+    Args:
+        profile (dict): A dictionary containing the profile settings.
+
+    Returns:
+        None: This function does not return a value, it operates in-place, modifying the 'profile' argument.
+    """
+    if "overview_compress" in profile:
+        if profile.get("overview_compress", None) != profile.get("compress", None):
+            for k in ["quality", "predictor"]:
+                if k in profile:
+                    del profile[k]
+    for k1, k2 in [
+        ("overview_compress", "compress"),
+        ("overview_quality", "quality"),
+        ("overview_predictor", "predictor"),
+    ]:
+        if k1 in profile:
+            profile[k2] = profile[k1]
+
+
+def _COG_graph_builder(
+    arr: da.Array,
+    mask: Optional[da.Array],
+    profile: Dict[str, any],
+    rasterio_env_options: Dict[str, any],
+) -> dask.delayed:
+    """
+    Makes a dask delayed graph that, when computed, writes a COG file to S3.
+
+    This function constructs a Dask delayed computation graph for creating a COG file from a Dask array.
+    It splits the array into parts, processes them, and returns a delayed computation graph to build the COG.
+
+    Args:
+        arr (dask.array.Array): The Dask array to create a COG from.
+        mask (dask.array.Array or None): An optional mask array for the COG.
+        profile (dict): A dictionary containing the COG profile settings.
+        rasterio_env_options (dict): A dictionary containing Rasterio environment options.
+
+    Returns:
+        dask.delayed: A Dask delayed object representing the computation graph to build the COG.
+    """
+    tif_part_maker_func = dask.delayed(_partial_COG_maker, nout=4)
+
+    # ensure the overview count is set
+    profile["overview_count"] = _get_maximum_overview_level(
+        profile["width"],
+        profile["height"],
+        minsize=profile["blocksize"],
+        overview_count=profile.get("overview_count", None),
+    )
+    profile = profile.copy()
+    overview_profile = profile.copy()
+    _adjust_compression(overview_profile)
+
+    del_profile = dask.delayed(profile, traverse=False)
+    del_overview_profile = dask.delayed(overview_profile, traverse=False)
+    del_rasterio_env_options = dask.delayed(rasterio_env_options, traverse=False)
+    current_level_profile = del_profile
+    parts_info = {}
+    parts_bytes = {}
+
+    for level in range(profile["overview_count"] + 1):
+        parts_info[level] = []
+        parts_bytes[level] = []
+        chunk_depth, chunk_heights, chunk_widths = arr.chunks
+        # matching gdal behaviour
+        if len(chunk_heights) > 1 and chunk_heights[-1] == 1:
+            chunk_heights = chunk_heights[:-1]
+        if len(chunk_widths) > 1 and chunk_widths[-1] == 1:
+            chunk_widths = chunk_widths[:-1]
+
+        # this is the slowest line by far. if not optimize_graph its faster but slower overall.
+        # if optimize_graph=True then the graph ends up reading in the source data many times
+        # if optimize_graph=False then the data is read more optimally but the building of the graph gets slower.
+        data_del = arr.to_delayed(optimize_graph=False).ravel()
+        res_arr = np.ndarray((len(chunk_heights), len(chunk_widths)), dtype=object)
+
+        mask_del = []
+        if mask is not None:
+            mask_del = mask.to_delayed(optimize_graph=False).ravel()
+            mask_res_arr = np.ndarray(
+                (len(chunk_heights), len(chunk_widths)), dtype=object
             )
 
-            part_writer_func = dask.delayed(tif_part_writer, nout=2)
-            outarr, part_info = part_writer_func(
-                blk,
-                i=mpu_part_id,
-                mpu_store = mpu_store,
-                writeLastOverview=last, 
-                pad=s3_min_part_bytes,
-                profile = profile,
-                rasterio_env_options = rasterio_env_options,
-                #dask_key_name=("tif_part_writer",level,ind,mpu_part_id,tokenize(ind,level,mpu_part_id,mpu_store.mpu))
+        for blk in zip_longest(data_del, mask_del):
+            ind = blk[0].key[1:][-2:]
+            overview_arr, mask_arr, part_bytes, part_info = tif_part_maker_func(
+                *blk,
+                profile=current_level_profile,
+                rasterio_env_options=del_rasterio_env_options,
             )
-            res_arr[ind] = dask.array.from_delayed(outarr, shape=blk_final_shape, dtype=da.dtype)
-            parts_info.append((level,ind,mpu_part_id,part_info))
-        if last:
-            break
-        da = dask.array.block(res_arr.tolist())
-        #copy the chunking from the initial data
-        da = da.rechunk(chunks= (chunk_heights[0], chunk_widths[0]))
+            parts_info[level].append((ind, part_info))
+            parts_bytes[level].append(part_bytes)
 
-    #print (mpu_part_id)
-    if mpu_part_id < s3_start_part:
-        raise ValueError ('too many parts - try starting with larger chunks')
-    return parts_info
+            # checks if the index falls within the array
+            # throwing away overviews that are an artifact of the way gdal produces overviews when there is a dimension of 1
+            if len([1 for s, i in zip(res_arr.shape[-2:], ind) if i < s]) == 2:
+                blk_final_shape = (
+                    chunk_depth[0],
+                    max(1, chunk_heights[ind[0]] // 2),
+                    max(1, chunk_widths[ind[1]] // 2),
+                )
+                res_arr[ind] = dask.array.from_delayed(
+                    overview_arr, shape=blk_final_shape, dtype=arr.dtype
+                )
+                if mask is not None:
+                    mask_res_arr[ind] = dask.array.from_delayed(
+                        mask_arr, shape=blk_final_shape[-2:], dtype=mask.dtype
+                    )
 
-def ifd_updater(memfile,block_data):
-    #memfile is a bytesIO object
+        arr = dask.array.block(res_arr.tolist())
+        # copy the chunking from the initial data - assuming the first chunk is indicative of appropriate chunking to use for overviews
+        arr = arr.rechunk(chunks=(chunk_depth[0], chunk_heights[0], chunk_widths[0]))
+        if mask is not None:
+            mask = dask.array.block(mask_res_arr.tolist())
+            mask = mask.rechunk(chunks=(chunk_heights[0], chunk_widths[0]))
+
+        current_level_profile = del_overview_profile
+
+    header_bytes_final = dask.delayed(prep_tiff_header)(
+        parts_info, del_profile, del_rasterio_env_options, mask=mask is not None
+    )
+    # sum as a shorthand for flattening a list in the right order
+    delayed_parts = sum(
+        [v for k, v in sorted(parts_bytes.items(), reverse=True)], [header_bytes_final]
+    )
+    return delayed_parts
+
+
+def _ifd_updater(
+    memfile: io.BytesIO,
+    block_data: Tuple[List[np.ndarray], List[np.ndarray]],
+    mask_data: Tuple[List[np.ndarray], List[np.ndarray]],
+) -> None:
+    """
+    Updates IFD (Image File Directory) entries in a TIFF file stored in a BytesIO object.
+
+    This function updates the 'TileOffsets' and 'TileByteCounts' entries in the TIFF file's IFD
+    based on the provided block data for main and mask pages.
+
+    Args:
+        memfile (BytesIO): A BytesIO object containing the TIFF file data.
+        block_data (List[List[List[int]]]): A list of lists containing block offsets and byte counts for main pages.
+        mask_data (List[List[List[int]]]): A list of lists containing block offsets and byte counts for mask pages.
+    """
     assert not memfile.closed, "memory file was closed before writing"
-    block_offsets,block_counts = block_data
+
+    def _update_page(page_id, block_offsets, block_counts):
+        tif.pages[page_id].tags["TileOffsets"].overwrite(block_offsets)
+        tif.pages[page_id].tags["TileByteCounts"].overwrite(block_counts)
+
+    # first gather the indexes for main and mask pages
+    memfile.seek(0)
     with tifffile.TiffFile(memfile) as tif:
-        for page,offs,cnts in zip(tif.pages,block_offsets,block_counts):
-            assert len(page.tags['TileOffsets'].value) == len(offs) == len(cnts), 'oh no data is muddled'
-            page.tags['TileOffsets'].overwrite(offs)
-            page.tags['TileByteCounts'].overwrite(cnts)
-        
-def ifd_offset_adjustments(header_length,parts_info):
-    '''
-    merging of ifd data into the right order needed for the concatenated COG tif header
-    also applies part offsets to the image data offsets
-    '''       
-    #apply cumulative offsets to tile offset data   
-    offset = header_length
-    #sorted by mpu_part_id
-    for level,ind,mpu_part_id,(part, data_len, TileOffsets, TileByteCounts) in sorted(parts_info, key= lambda y: y[2]):
-        for arr in TileOffsets:
-            #note this modifies in place!
-            arr[arr > 0] += offset
-        offset += data_len
+        main = []
+        mask = []
+        for p in tif.pages:
+            if "MASK" in str(p.tags.get("NewSubfileType", "")):
+                mask.append(p.index)
+            else:
+                main.append(p.index)
 
-    #rearrange info arrays into a format that suits.
-    rearranged_info = {}
-    for level,ind,mpu_part_id,(part, data_len, TileOffsets, TileByteCounts) in sorted(parts_info):
-    #for level,ind,_,TileOffsets,TileByteCounts in sorted(parts_info.values()):
-        for level2,(to,tb) in enumerate(zip(TileOffsets,TileByteCounts)):
-            rearranged_info.setdefault((level,level2), []).append((ind,to,tb))
+    # write the data to the ifd ensuring to interleave the main and mask offsets/bytecounts
+    # ignore mask data if there are no mask ifds
+    for (
+        main_id,
+        mask_id,
+        main_page_data_off,
+        main_page_data_cnts,
+        mask_page_data_off,
+        mask_page_data_cnts,
+    ) in zip_longest(main, mask, *block_data, *mask_data):
+        _update_page(main_id, main_page_data_off, main_page_data_cnts)
+        if mask_id is not None:
+            _update_page(mask_id, mask_page_data_off, mask_page_data_cnts)
 
-    #second stage of rearranging into the final arrangement that is needed for the tif headers
+
+def _ifd_offset_adjustments(
+    header_length: int, parts_info: dict
+) -> Tuple[
+    Tuple[List[np.ndarray], List[np.ndarray]], Tuple[List[np.ndarray], List[np.ndarray]]
+]:
+    """
+    Merges IFD (Image File Directory) data into the right order needed for the concatenated COG TIFF header.
+    Also applies part offsets to the image data offsets.
+
+    Args:
+        header_length (int): The length of the TIFF header in bytes.
+        parts_info (dict): A dictionary containing information about image parts, including offsets and byte counts.
+
+    Returns:
+        Tuple[Tuple[List[np.ndarray], List[np.ndarray]], Tuple[List[np.ndarray], List[np.ndarray]]]:
+            A tuple containing two sub-tuples, each consisting of a list of arrays.
+            - The first sub-tuple contains block offsets and block byte counts for main image data.
+            - The second sub-tuple contains block offsets and block byte counts for mask image data (if present).
+
+    Notes:
+        - This function assumes that the provided `parts_info` dictionary contains information about image parts
+          for different overview levels. The data is processed and merged in the appropriate order.
+        - The resulting offsets and byte counts are returned in reverse order, as header pages are usually stored
+          in reverse order in a concatenated COG TIFF.
+    """
     block_offsets = []
     block_counts = []
-    for v in rearranged_info.values():
-        #rely on things being correctly sorted
-        #get the last 2d index and  convert it to a 2d shape
-        shp = (v[-1][0][0]+1,v[-1][0][1]+1)
-        #place all the blocks into 2d arrays
-        TileOffsets_arr = np.ndarray(shp, dtype=object)
-        TileByteCounts_arr = np.ndarray(shp, dtype=object)
-        for ind,TileOffsets,TileByteCounts in v:
+    mask_offsets = []
+    mask_counts = []
+    # apply cumulative offsets to tile offset data
+    offset = header_length
+    # the order produced is right except the levels need reversing - should match the order data is written to file
+    for level in sorted(parts_info, reverse=True):
+        blk_ind_last_blk = [xy + 1 for xy in parts_info[level][-1][0]]
+        TileOffsets_arr = np.ndarray(blk_ind_last_blk, dtype=object)
+        TileByteCounts_arr = np.ndarray(blk_ind_last_blk, dtype=object)
+        for ind, (TileOffsets, TileByteCounts, bytes_total_len) in parts_info[level]:
+            # note this modifies in place!
+            TileOffsets[TileByteCounts > 0] += offset
+            TileOffsets[TileByteCounts == 0] = 0  # sparse tif data
+
+            # set the offset for the next level
+            offset += bytes_total_len
+
             TileOffsets_arr[ind] = TileOffsets
             TileByteCounts_arr[ind] = TileByteCounts
-        #make block arrays into arrays and then flatten them
-        block_offsets.append(np.block(TileOffsets_arr.tolist()).ravel())
-        block_counts.append(np.block(TileByteCounts_arr.tolist()).ravel())
 
-    return (block_offsets, block_counts)
-                              
-def write_tiff_header(mpu_store,header_bytes,parts_info):
-    '''update the header and finish writing to the mpu
-    '''                             
-    #extend so at least s3_min_part_bytes long due to s3 minimum file size
-    header_bytes = header_bytes.ljust(s3_min_part_bytes, b"\0")
-    #adjust the block data
-    block_data = ifd_offset_adjustments(len(header_bytes),parts_info)
-    #write the block data into the header
+        # make block arrays into arrays and then flatten them
+        TileOffsets_merged = np.block(TileOffsets_arr.tolist())
+        TileByteCounts_merged = np.block(TileByteCounts_arr.tolist())
+
+        block_offsets.append(TileOffsets_merged[0].ravel())
+        block_counts.append(TileByteCounts_merged[0].ravel())
+
+        mask_offsets.append(TileOffsets_merged[1].ravel())
+        mask_counts.append(TileByteCounts_merged[1].ravel())
+
+    # reverse as the header pages are in reverse order
+    return (block_offsets[::-1], block_counts[::-1]), (
+        mask_offsets[::-1],
+        mask_counts[::-1],
+    )
+
+
+def prep_tiff_header(
+    parts_info: dict, profile: dict, rasterio_env_options: dict, mask: bool
+) -> bytes:
+    """
+    Update the TIFF header.
+
+    Args:
+        parts_info (dict): A dictionary containing information about image parts, including offsets and byte counts.
+        profile (dict): A dictionary representing the profile of the COG image.
+        rasterio_env_options (dict): Options for configuring Rasterio's environment.
+        mask (bool): A boolean indicating whether the COG image has a mask.
+
+    Returns:
+        bytes: The updated COG TIFF header data.
+    """
+    header_bytes = _empty_COG(
+        profile, rasterio_env_options=rasterio_env_options, mask=mask
+    )
+    # adjust the block data
+    # print (parts_info)
+    block_data, mask_data = _ifd_offset_adjustments(len(header_bytes), parts_info)
+
+    # write the block data into the header
     with io.BytesIO(header_bytes) as memfile:
-        ifd_updater(memfile,block_data)
-        modify_COG_ghost_header(memfile)
+        _ifd_updater(memfile, block_data, mask_data)
+        memfile.seek(0)
         header_data = memfile.getvalue()
+    return header_data
 
-    assert len(header_data) <= s3_max_part_bytes , 'part too big for s3 part upload'
-    parts = [part for level,ind,mpu_part_id,(part, data_len, TileOffsets, TileByteCounts) in parts_info]
-    #write the header to the first (1) mpu part
-    parts.append(mpu_store.upload_part_mpu(1, header_data))
-    mpu_store.complete_mpu(parts)
-    
-def chunky_checker(dask_arr,blockSize):
-    '''ccog has specific chunking requirements
-    
-    this checks that they are met
-    '''
-    valid_chunk_dims = [blockSize* 2**e for e in range(30)]#use a range bigger then ever expected
-    if len(dask_arr.chunks) != 2:
-        raise ValueError ('currently only works with 2d arrays')
-    chunk_heights,chunk_widths = dask_arr.chunks
-    if len(set(chunk_heights[:-1])) > 1 or len(set(chunk_widths[:-1]))  > 1:
-        raise ValueError ('chunking needs to be consistant (except the last in any dimension)')
-    if len(chunk_heights)>1 and len(chunk_widths)>1:
-        if chunk_heights[0] != chunk_widths[0]:
-            raise ValueError ('chunking needs to be square')
-    if len(chunk_heights)>1 :
-        if chunk_heights[-1] >= 2 * chunk_heights[0]:
-            raise ValueError ('last chunk too large')
-        if chunk_heights[0] not in valid_chunk_dims[1:] :
-            raise ValueError ('chunk size needs to be in the power of 2 series starting after blockSize')
-    if len(chunk_widths)>1 :
-        if chunk_widths[-1] >= 2 * chunk_widths[0]:
-            raise ValueError ('last chunk too large')
-        if chunk_widths[0] not in valid_chunk_dims[1:] :
-            raise ValueError ('chunk size needs to be in the power of 2 series starting after blockSize')
 
-def write_ccog(x_arr,store, COG_creation_options = None, rasterio_env_options = None, storage_options = None):
-    '''writes a concatenated COG to S3
-    x_arr an xarray array.
-        notes on chunking:
-        ccog is picky about chunking and will tell you about it.
-        most chunks should be square and with a dimension powers of 2 of block size 
-        so if your block size is 512 then chunks of one of 1024,2048,4096,8192,16384....etc
-        larger chunks are better - limited to your available ram
-        small chunks may result in some bloat in the final file or trigger some errors due to limitations in s3 uploads.
-    store is an s3 file path or fsspec mapping
-    storage_options (dict, optional) – Any additional parameters for the storage backend
-    COG_creation_options (dict, optional) – options as described here https://gdal.org/drivers/raster/cog.html#creation-options
-        unlike gdal resampling defaults to nearest unless specified
-        not all creation options are available at this stage.
-    rasterio_env_options (dict, optional) –  options as described here https://rasterio.readthedocs.io/en/latest/topics/image_options.html#configuration-options
-        gdal exposes many configuration options how (or if) any particular option works with ccog is untested
-        ccog does all its work in memory so many of the commonly used gdal config options are unlikely to be useful, but the option is there if you want to try.
-        They may be better used with however you open data to make your xarray. 
-        
+def write_ccog(
+    arr: Union[da.Array, xarray.DataArray],
+    mask: Optional[Union[da.Array, xarray.DataArray]] = None,
+    *,
+    store: Optional[str] = None,
+    COG_creation_options: Optional[Dict[str, any]] = None,
+    rasterio_env_options: Optional[Dict[str, any]] = None,
+    storage_options: Optional[Dict[str, any]] = None,
+) -> Delayed:
+    """Creates a dask graph that when computed produces a concatenated COG either as bytes or written to S3.
+    
+    if arr chunks are full width OR there height equals profile['blocksize'] then the GDAL COG ghost optimisations are retained
 
-    
-    returns a dask.delayed object
-    
-    TODO: shortcut route if a small array can just be handled as a single part
-    TODO: work with GDAL config settings (environment)
-    '''
+    Args:
+        arr (Union[da.Array, xarray.DataArray]): The data array to write as a COG. It can be a dask array or xarray DataArray.
+        mask (Optional[Union[da.Array, xarray.DataArray]]): A mask array for the data. It can be a dask array or xarray DataArray. Default is None.
+        store (Optional[str]): An S3 file path or fsspec mapping. If not included, the function will produce dask graph that when computed produces a list of bytes that make up the COG file. Default is None.
+        COG_creation_options (Optional[Dict[str, any]]): Options for configuring the COG creation. Default is None.
+        rasterio_env_options (Optional[Dict[str, any]]): Options for configuring Rasterio's environment. Default is None.
+        storage_options (Optional[Dict[str, any]]): Any additional parameters for the storage backend. Default is None.
+
+    Returns:
+        Delayed: A dask.delayed object representing the process of creating the COG.
+    """
+    # todo:
+    # In addition to the gdal option an optional colormap is accepted. This only works with a single int8 band.
+    # eg colormap = {0:(4,0,0,4),255:(0,0,4,4)}
+    # for more info see https://rasterio.readthedocs.io/en/stable/topics/color.html
+
+    # TODO: shortcut route if a small array can just be handled as a single part
+    # TODO: work with GDAL config settings (environment)
+
     COG_creation_options = {} if COG_creation_options is None else COG_creation_options
     rasterio_env_options = {} if rasterio_env_options is None else rasterio_env_options
     storage_options = {} if storage_options is None else storage_options
-    
-    print ('warning ccog is only a proof of concept at this stage.... enjoy')
-    
-    if not isinstance(x_arr,xarray.core.dataarray.DataArray):
-        raise TypeError (' x_arr must be an instance of xarray.core.dataarray.DataArray')
-    
-    #normalise keys to lower case for ease of referencing
-    user_creation_options = {key.lower():val for key,val in COG_creation_options.items() }
-    
-    #throw error as these options not been tested and may not work
-    #overview_count is used internally
-    exclude_opts = [opt for opt in ['warp_resampling','target_srs','tiling_scheme','overview_count'] if opt in user_creation_options]
-    if exclude_opts:
-        raise ValueError (f'ccog cant work with COG_creation_options of {exclude_opts}')
-                
-    if 'overview_resampling' not in user_creation_options and 'resampling' in user_creation_options:
-        user_creation_options['overview_resampling'] = user_creation_options['resampling']
-        del user_creation_options['resampling']
-    
-    #todo: error if required_creation_options are goign to change user_creation_options
 
-    #build the profile from layering profile sources sequentially making sure most important end up with precendence.
+    # normalise keys and string values to lower case for ease of use
+    user_creation_options = {
+        key.lower(): val.lower() if isinstance(val, str) else val
+        for key, val in COG_creation_options.items()
+    }
+    rasterio_env_options = {
+        key.lower(): val.lower() if isinstance(val, str) else val
+        for key, val in rasterio_env_options.items()
+    }
+
+    rasterio_env_options = rasterio_env_options.copy()
+    rasterio_env_options.update(required_rasterio_env_options)
+
+    # throw error as these options have not been tested and likely wont work as expected
+    incompatable_options = [
+        "warp_resampling",  # no reprojection allowed
+        "target_srs",  # no reprojection allowed
+        "tiling_scheme",  # no reprojection allowed
+        "interleave",  # not currently available in the COG driver but if set to BAND the code will need some further work
+        # not currently available in the COG driver but if becomes available will need testing
+        "jpegtablesmode",
+        "blockxsize",  # use blocksize
+        "blockysize",  # use blocksize
+    ]
+    incompatable_options.extend(required_creation_options.keys())
+    exclude_opts = [opt for opt in incompatable_options if opt in user_creation_options]
+    if exclude_opts:
+        raise ValueError(f"ccog cant work with COG_creation_options of {exclude_opts}")
+
+    if (
+        "overview_resampling" not in user_creation_options
+        and "resampling" in user_creation_options
+    ):
+        user_creation_options["overview_resampling"] = user_creation_options[
+            "resampling"
+        ]
+        del user_creation_options["resampling"]
+
+    if not isinstance(arr, (xarray.core.dataarray.DataArray, dask.array.core.Array)):
+        raise TypeError(" arr must be an instance of xarray DataArray or dask Array")
+
+    # todo: raise error if required_creation_options are going to change user_creation_options
+    # build the profile and env_options by layering sources sequentially making sure most important end up with precendence.
     profile = default_creation_options.copy()
-    profile.update(xarray_to_profile(x_arr))
+
+    # get useful stuff from xarray via rioxarray
+    if isinstance(arr, xarray.core.dataarray.DataArray):
+        profile["transform"] = arr.rio.transform()
+        profile["crs"] = arr.rio.crs
+        profile["nodata"] = arr.rio.nodata
+        arr = arr.data
+
     profile.update(user_creation_options)
     profile.update(required_creation_options)
-    
-    if int(profile['blocksize']) % 256: 
-        #really the tiff rule is 16 but that is a very small block
-        raise ValueError (f'blocksize must be multiples of 256')
 
-    #check chunking.
-    chunky_checker(x_arr.data,profile['blocksize'])
-    
-    #building the delayed graph
-    mpu_store = dask.delayed(aws_tools.Mpu)(store,storage_options=storage_options)
-    parts_info = nested_graph_builder(x_arr.data,mpu_store,profile=profile,rasterio_env_options=rasterio_env_options)
+    if int(profile["blocksize"]) % 16:
+        # the tiff rule is 16 but that is a very small block, resulting in a large header. consider a 256 minimum?
+        raise ValueError(f"blocksize must be multiples of 16")
+    profile["blockxsize"] = profile["blockysize"] = profile["blocksize"]
 
-    #empty_single_band_COG is slow for large COGs
-    #if its not part of write_tiff_header it runs concurrently with other jobs.
-    header_bytes = dask.delayed(empty_single_band_COG)(profile, rasterio_env_options= rasterio_env_options)
-    delayed_graph = dask.delayed(write_tiff_header)(mpu_store, header_bytes, parts_info)
+    # handle single band data the same as multiband data
+    if len(arr.shape) == 2:
+        arr = arr.reshape([1] + [*arr.shape])
+    # check chunking.
+    if any([dim % profile["blocksize"] for dim in arr.chunks[-2][:-1]]) or any(
+        [dim % profile["blocksize"] for dim in arr.chunks[-1][:-1]]
+    ):
+        raise ValueError(
+            "chunking needs to be multiples of the blocksize (except the last in any spatial dimension)"
+        )
+    if len(arr.chunks) == 3 and len(arr.chunks[0]) > 1:
+        raise ValueError("non spatial dimension chunking needs to be a single chunk")
+
+    # keep the ghost data if the chunking allows it
+    if (
+        all([dim == profile["blocksize"] for dim in arr.chunks[-2][:-1]])
+        or len(arr.chunks[-1]) == 1
+    ):
+        profile["cog_ghost_data"] = True
+
+    profile["count"] = arr.shape[0]
+    profile["height"] = arr.shape[1]
+    profile["width"] = arr.shape[2]
+    profile["dtype"] = arr.dtype.name
+
+    # mask - check
+    if mask is not None:
+        if not isinstance(
+            mask, (xarray.core.dataarray.DataArray, dask.array.core.Array)
+        ):
+            raise TypeError(
+                " mask must be an instance of xarray DataArray or dask Array"
+            )
+        if isinstance(mask, xarray.core.dataarray.DataArray):
+            mask = mask.data
+        if arr.chunks[-2:] != mask.chunks:
+            raise ValueError("mask spatial chunks needs to match those of arr")
+        # todo: also check CRS and transform match
+
+    # building the delayed graph
+    delayed_graph = _COG_graph_builder(
+        arr, mask, profile=profile, rasterio_env_options=rasterio_env_options
+    )
+    if store:
+        delayed_graph = aws_tools.mpu_upload_dask_partitioned(
+            delayed_graph, store, storage_options=storage_options
+        )
     return delayed_graph
-

@@ -14,10 +14,11 @@ setup(
         'numpy',
         'xarray',
         'rasterio',
+        'rioxarray',
         'dask',
-        'distributed',
         'tifffile',
         'affine>=2.4', #recent bug fix
+        'more_itertools',
         ],
     entry_points={
         'console_scripts': []
