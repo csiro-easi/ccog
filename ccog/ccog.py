@@ -38,6 +38,17 @@ default_creation_options = dict(
     cog_ghost_data=False,
 )
 
+#these must be even
+#based on testing with GDAL
+resample_overlaps = {'nearest': 0,
+                     'average': 0,
+                     'mode': 0,
+                     'rms': 0,
+                     'bilinear': 2,
+                     'cubic': 4,
+                     'cubicspline': 4,
+                     'lanczos': 6}
+
 
 def _get_maximum_overview_level(
     width: int, height: int, minsize: int = 256, overview_count: Optional[int] = None
@@ -276,11 +287,84 @@ def _test_jpegtables(
                 empty_JPEGTables = tif.pages[0].tags["JPEGTables"].value
     if empty_JPEGTables != JPEGTables:
         raise ValueError("different JPEGTables")
+        
+def _overview_maker(
+    arr: np.ndarray,
+    mask: Union[np.ndarray,None],
+    overlap_map,
+    profile: Dict,
+    rasterio_env_options: Optional[Dict],
+    return_file = True,
+    return_overviews=True,
+) -> Tuple[
+    np.ndarray,
+    Optional[np.ndarray],
+]:
+    
+    '''
+    making reduced resolution overview.
+    
+    using GDAL
+    there is probably already some nice dask tools for this but matching GDAL exactly is 
+    worthwhile here in the first instance.
+    '''
+    
+    profile = profile.copy()  # careful not to update in place
+    profile["height"] = arr.shape[1]
+    profile["width"] = arr.shape[2]
+    # not using the transform in profile as its going to be wrong - make it obviously wrong avoids rasterio warnings
+    profile["transform"] = Affine.scale(2)
+    
+    if not return_file:
+        profile["compress"] = "NONE"
+    # the overview is only used for resampling its not stored
+    profile["overview_compress"] = "NONE"
+    profile["overview_count"] = 1
+    overview_arr = None
+    mask_overview_arr = None
+    file_bytes = None
+    
+    if profile["height"] == 1 and profile["width"] == 1:
+        # stops gdal throwing an error
+        # in the case of a 1x1 pixel input return it as the overview
+        profile["overview_count"] = 0
+        overview_arr = arr
+        mask_overview_arr = mask
+        
+    #window for removing overlaps in overview
+    overlap_map = [None if x is None else x//2 for x in overlap_map ]
+    window = rasterio.windows.Window.from_slices(rows = overlap_map[:2],
+                                                 cols = overlap_map[-2:],
+                                                 height = max(1,profile['height']//2),
+                                                 width = max(1,profile['width']//2))
+    
+    with (rasterio.Env(**rasterio_env_options), rasterio.io.MemoryFile() as memfile):
+        with memfile.open(**profile) as src:
+            src.write(arr)
+            del arr  # reducing mem footprint
+            if mask is not None:
+                src.write_mask(mask)
 
+        if profile["overview_count"] and return_overviews:
+            with memfile.open(overview_level=0) as src:
+                # get the required overview back as an array
+                overview_arr = src.read(window=window)
+                if mask is not None:
+                    # mask is the same for all bands
+                    mask_overview_arr = src.read_masks(1,window=window)
+            to_return = [overview_arr, mask_overview_arr]
+                    
+        if return_file:
+            _= memfile.seek(0)
+            file_bytes = memfile.read()
+
+    return overview_arr, mask_overview_arr,file_bytes
+    
 
 def _partial_COG_maker(
     arr: np.ndarray,
-    mask: Optional[np.ndarray],
+    mask: Union[np.ndarray,None],
+    overlap_map,
     profile: Dict,
     rasterio_env_options: Optional[Dict],
 ) -> Tuple[
@@ -312,95 +396,74 @@ def _partial_COG_maker(
             - databytecounts (np.ndarray): Count of bytes in each data block.
             - len(part_bytes) (int): Length of part_bytes.
     """
-    profile = profile.copy()  # careful not to update in place
-    profile["height"] = arr.shape[1]
-    profile["width"] = arr.shape[2]
-    # not using the transform in profile as its going to be wrong - make it obviously wrong avoids rasterio warnings
-    profile["transform"] = Affine.scale(2)
-    # the overview is only used for resampling its not stored
-    profile["overview_compress"] = "NONE"
-    profile["overview_count"] = 1
-    overview_arr = None
-    mask_overview_arr = None
-    if profile["height"] == 1 and profile["width"] == 1:
-        # stops gdal throwing an error
-        # in the case of a 1x1 pixel input return it as the overview
-        profile["overview_count"] = 0
-        overview_arr = arr
-        mask_overview_arr = mask
 
-    with rasterio.Env(**rasterio_env_options):
-        with rasterio.io.MemoryFile() as memfile:
-            with memfile.open(**profile) as src:
-                src.write(arr)
-                del arr  # reducing mem footprint
-                if mask is not None:
-                    src.write_mask(mask)
+    overview_arr, mask_overview_arr,file_bytes = _overview_maker(arr,mask,overlap_map,profile,rasterio_env_options)
+    if not (overlap_map==None).all():
+        #if resampling requires overlaps then the creation of the overview has to happed seperate to the creation of the main image data.
+        overview_arr, mask_overview_arr,_ = _overview_maker(arr,mask,overlap_map,profile,rasterio_env_options,return_file=False)
+        #strip the overlap from arr and mask
+        arr = arr[:,slice(*overlap_map[:2]),slice(*overlap_map[-2:])]
+        if mask is not None:
+            mask = mask[slice(*overlap_map[:2]),slice(*overlap_map[-2:])]
+        _,_,file_bytes = _overview_maker(arr,mask,overlap_map,profile,rasterio_env_options,return_overviews=False)
 
-            if profile["overview_count"]:
-                with memfile.open(overview_level=0) as src:
-                    # get the required overview back as an array
-                    overview_arr = src.read()
-                    if mask is not None:
-                        # mask is the same for all bands
-                        mask_overview_arr = src.read_masks(1)
+    with (
+        io.BytesIO(file_bytes) as memfile,
+        tifffile.TiffFile(memfile) as tif
+    ):
+        page = tif.pages[0]
+        if profile["compress"] == "jpeg":
+            _test_jpegtables(page.tags["JPEGTables"].value,
+                             profile,
+                             rasterio_env_options)
 
-            # removing the gdal ghost leaders
-            memfile.seek(0)
-            with tifffile.TiffFile(memfile) as tif:
-                page = tif.pages[0]
-                if profile["compress"] == "jpeg":
-                    _test_jpegtables(
-                        page.tags["JPEGTables"].value, profile, rasterio_env_options
-                    )
+        # always make mask data ignore it later if not needed. dim order to interleave data and mask.
+        tile_dims_count = (
+            math.ceil(page.imagelength / page.tilelength),
+            math.ceil(page.imagewidth / page.tilewidth),
+            2,
+        )
+        databytecounts = np.zeros(tile_dims_count, dtype=np.int32)
+        databytecounts[:, :, 0] = np.reshape(
+            page.databytecounts, tile_dims_count[:2]
+        )
+        databyteoffsets = np.zeros(tile_dims_count, dtype=np.int64)
+        databyteoffsets[:, :, 0] = np.reshape(
+            page.dataoffsets, tile_dims_count[:2]
+        )
+        if mask is not None:
+            mask_page = tif.pages[1]
+            databytecounts[:, :, 1] = np.reshape(
+                mask_page.databytecounts, tile_dims_count[:2]
+            )
+            databyteoffsets[:, :, 1] = np.reshape(
+                mask_page.dataoffsets, tile_dims_count[:2]
+            )
 
-                # always make mask data ignore it later if not needed. dim order to interleave data and mask.
-                tile_dims_count = (
-                    math.ceil(page.imagelength / page.tilelength),
-                    math.ceil(page.imagewidth / page.tilewidth),
-                    2,
-                )
-                databytecounts = np.zeros(tile_dims_count, dtype=np.int32)
-                databytecounts[:, :, 0] = np.reshape(
-                    page.databytecounts, tile_dims_count[:2]
-                )
-                databyteoffsets = np.zeros(tile_dims_count, dtype=np.int64)
-                databyteoffsets[:, :, 0] = np.reshape(
-                    page.dataoffsets, tile_dims_count[:2]
-                )
-                if mask is not None:
-                    mask_page = tif.pages[1]
-                    databytecounts[:, :, 1] = np.reshape(
-                        mask_page.databytecounts, tile_dims_count[:2]
-                    )
-                    databyteoffsets[:, :, 1] = np.reshape(
-                        mask_page.dataoffsets, tile_dims_count[:2]
-                    )
+        new_databyteoffsets = []
+        current_offset = 0
+        part_bytes = bytearray()
+        # Collect up bytes and optional gdal leading and trailing ghosts
+        for offset, bytecount in zip(
+            databyteoffsets.ravel(), databytecounts.ravel()
+        ):
+            if bytecount:
+                if profile["cog_ghost_data"]:
+                    part_bytes.extend(bytecount.tobytes())
+                    current_offset += 4
 
-            new_databyteoffsets = []
-            current_offset = 0
-            part_bytes = bytearray()
-            # Collect up bytes and optional gdal leading and trailing ghosts
-            for offset, bytecount in zip(
-                databyteoffsets.ravel(), databytecounts.ravel()
-            ):
-                if bytecount:
-                    if profile["cog_ghost_data"]:
-                        part_bytes.extend(bytecount.tobytes())
-                        current_offset += 4
+                new_databyteoffsets.append(current_offset)
+                _ = memfile.seek(offset)
+                part_bytes.extend(memfile.read(bytecount))
+                current_offset += bytecount
 
-                    new_databyteoffsets.append(current_offset)
-                    _ = memfile.seek(offset)
-                    part_bytes.extend(memfile.read(bytecount))
-                    current_offset += bytecount
+                if profile["cog_ghost_data"]:
+                    part_bytes.extend(part_bytes[-4:])
+                    current_offset += 4
+            else:
+                new_databyteoffsets.append(0)  # sparse values
 
-                    if profile["cog_ghost_data"]:
-                        part_bytes.extend(part_bytes[-4:])
-                        current_offset += 4
-                else:
-                    new_databyteoffsets.append(0)  # sparse values
-
-    # moveaxis to un interleave the
+    # moveaxis to un interleave this
     databyteoffsets = np.moveaxis(
         np.reshape(new_databyteoffsets, tile_dims_count), -1, 0
     )
@@ -445,14 +508,26 @@ def _chunk_adjuster(arr,min_chunk_dim = 12):
     
     the default of 12 is based on analysis of the resampling in gdal and that is the largest radius of edge effects
     '''
-    chunk_depth,chunk_heights,chunk_widths = dask_arr.chunks
+    chunk_heights,chunk_widths = arr.chunks[-2:]
     #merge the second to last chunks if too small
     if len(chunk_heights) > 1 and chunk_heights[-1] <= min_chunk_dim:
         chunk_heights = (*chunk_heights[:-2],sum(chunk_heights[-2:]))
     if len(chunk_widths) > 1 and chunk_widths[-1] <= min_chunk_dim:
         chunk_widths = (*chunk_widths[:-2],sum(chunk_widths[-2:]))
-    arr = arr.rechunk(chunks=(chunk_depth,chunk_heights,chunk_widths))
+    arr = arr.rechunk(chunks=(*arr.chunks[:-2],chunk_heights,chunk_widths))
     return arr
+
+def _unoverlap_slices(shape,overlap):
+    '''
+    map to overlaps on dask chunks when using dask.array.overlap.overlap
+    '''
+    arr = np.full((*shape,4),None)
+    if overlap:
+        arr[1:,:,0] = overlap 
+        arr[0:-1,:,1] = -overlap
+        arr[:,1:,2] = overlap 
+        arr[:,0:-1,3] = -overlap
+    return arr.reshape((-1,4))
 
             
 def _COG_graph_builder(
@@ -478,7 +553,7 @@ def _COG_graph_builder(
     """
     tif_part_maker_func = dask.delayed(_partial_COG_maker, nout=4)
     
-    arr = _chunk_adjuster(arr)
+
     
     # ensure the overview count is set
     profile["overview_count"] = _get_maximum_overview_level(
@@ -499,6 +574,7 @@ def _COG_graph_builder(
     parts_bytes = {}
 
     for level in range(profile["overview_count"] + 1):
+        arr = _chunk_adjuster(arr)
         parts_info[level] = []
         parts_bytes[level] = []
         chunk_depth, chunk_heights, chunk_widths = arr.chunks
@@ -507,21 +583,28 @@ def _COG_graph_builder(
             chunk_heights = chunk_heights[:-1]
         if len(chunk_widths) > 1 and chunk_widths[-1] == 1:
             chunk_widths = chunk_widths[:-1]
+        
+        overlap_count = resample_overlaps[profile['overview_resampling']]
+        if overlap_count:
+            arr = dask.array.overlap.overlap(arr,(0,overlap_count,overlap_count),'none',allow_rechunk=False)
 
         # this is the slowest line by far. if not optimize_graph its faster but slower overall.
         # if optimize_graph=True then the graph ends up reading in the source data many times
         # if optimize_graph=False then the data is read more optimally but the building of the graph gets slower.
-        data_del = arr.to_delayed(optimize_graph=False).ravel()
+        data_del = arr.to_delayed(optimize_graph=False)
         res_arr = np.ndarray((len(chunk_heights), len(chunk_widths)), dtype=object)
 
         mask_del = []
         if mask is not None:
+            mask = _chunk_adjuster(mask)
+            if overlap_count:
+                mask = dask.array.overlap.overlap(mask,(overlap_count,overlap_count),'none',allow_rechunk=False)
             mask_del = mask.to_delayed(optimize_graph=False).ravel()
             mask_res_arr = np.ndarray(
                 (len(chunk_heights), len(chunk_widths)), dtype=object
             )
-
-        for blk in zip_longest(data_del, mask_del):
+        unoverlap = _unoverlap_slices(data_del.shape[-2:],overlap_count)
+        for blk in zip_longest(data_del.ravel(), mask_del,unoverlap):
             ind = blk[0].key[1:][-2:]
             overview_arr, mask_arr, part_bytes, part_info = tif_part_maker_func(
                 *blk,
@@ -786,6 +869,9 @@ def write_ccog(
             "resampling"
         ]
         del user_creation_options["resampling"]
+        
+    if "overview_resampling" not in user_creation_options or user_creation_options["overview_resampling"] not in resample_overlaps:
+        raise ValueError(f"COG_creation_options needs to include a valid GDAL COG driver 'overview_resampling' selection")
 
     if not isinstance(arr, (xarray.core.dataarray.DataArray, dask.array.core.Array)):
         raise TypeError(" arr must be an instance of xarray DataArray or dask Array")
