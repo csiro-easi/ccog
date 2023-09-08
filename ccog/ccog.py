@@ -723,8 +723,8 @@ def prep_tiff_header(parts_info: dict, profile: dict, rasterio_env_options: dict
 
 
 def write_ccog(
-    arr: Union[da.Array, xarray.DataArray],
-    mask: Optional[Union[da.Array, xarray.DataArray]] = None,
+    arr: Union[da.Array, xarray.DataArray, np.ndarray],
+    mask: Optional[Union[da.Array, xarray.DataArray, np.ndarray]] = None,
     *,
     store: Optional[str] = None,
     COG_creation_options: Optional[Dict[str, any]] = None,
@@ -741,8 +741,8 @@ def write_ccog(
     Values of BILINEAR/CUBIC/CUBICSPLINE/LANCZOS use a more complex graph to avoid edge effects.
 
     Args:
-        arr (Union[da.Array, xarray.DataArray]): The data array to write as a COG. It can be a dask array or xarray DataArray.
-        mask (Optional[Union[da.Array, xarray.DataArray]]): A mask array for the data. It can be a dask array or xarray DataArray. Default is None.
+        arr (Union[da.Array, xarray.DataArray, np.ndarray]): The data array to write as a COG. It can be a dask array, xarray DataArray or numpy ndarray.
+        mask (Optional[Union[da.Array, xarray.DataArray, np.ndarray]]): A mask array for the data. It can be a dask array, xarray DataArray or numpy ndarray. Default is None.
         store (Optional[str]): An S3 file path or fsspec mapping. If not included, the function will produce dask graph that when computed produces a list of bytes that make up the COG file. Default is None.
         COG_creation_options (Optional[Dict[str, any]]): Options for configuring the COG creation. Default is None.
         rasterio_env_options (Optional[Dict[str, any]]): Options for configuring Rasterio's environment. Default is None.
@@ -802,9 +802,9 @@ def write_ccog(
             f"COG_creation_options needs to include a valid GDAL COG driver 'overview_resampling' selection"
         )
 
-    if not isinstance(arr, (xarray.core.dataarray.DataArray, dask.array.core.Array)):
+    if not isinstance(arr, (xarray.core.dataarray.DataArray, dask.array.core.Array, np.ndarray)):
         raise TypeError(" arr must be an instance of xarray DataArray or dask Array")
-
+        
     # todo: raise error if required_creation_options are going to change user_creation_options
     # build the profile and env_options by layering sources sequentially making sure most important end up with precendence.
     profile = default_creation_options.copy()
@@ -815,6 +815,9 @@ def write_ccog(
         profile["crs"] = arr.rio.crs
         profile["nodata"] = arr.rio.nodata
         arr = arr.data
+        
+    if isinstance(arr, np.ndarray):
+        arr = dask.array.from_array(arr)
 
     profile.update(user_creation_options)
     profile.update(required_creation_options)
@@ -846,10 +849,12 @@ def write_ccog(
 
     # mask - check
     if mask is not None:
-        if not isinstance(mask, (xarray.core.dataarray.DataArray, dask.array.core.Array)):
+        if not isinstance(mask, (xarray.core.dataarray.DataArray, dask.array.core.Array, np.ndarray)):
             raise TypeError(" mask must be an instance of xarray DataArray or dask Array")
         if isinstance(mask, xarray.core.dataarray.DataArray):
             mask = mask.data
+        if isinstance(mask, np.ndarray):
+            mask = dask.array.from_array(mask)
         if arr.chunks[-2:] != mask.chunks:
             raise ValueError("mask spatial chunks needs to match those of arr")
         # todo: also check CRS and transform match
