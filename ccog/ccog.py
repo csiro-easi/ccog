@@ -27,13 +27,13 @@ required_creation_options = dict(
     # num_threads="all_cpus",  # TODO: test what difference this makes if any on a dask cluster
     tiled="yes",  # only needed if switching to use the Gtiff driver
     overviews="auto",
+    sharing = False,
 )
 
 default_creation_options = dict(
     sparse_ok=True,
     geotiff_version=1.1,  # why not use the latest by default
     blocksize=512,
-    compress=None,
     cog_ghost_data=False,
 )
 
@@ -48,6 +48,7 @@ resample_overlaps = {
     "cubic": 4,
     "cubicspline": 4,
     "lanczos": 6,
+    "gauss":2,
 }
 
 
@@ -147,10 +148,8 @@ def _empty_COG(profile: dict, rasterio_env_options: Optional[Dict] = None, mask:
 
     with rasterio.Env(**rasterio_env_options):
         with rasterio.io.MemoryFile() as memfile:
-            # print (prof)
             with memfile.open(**prof) as src:
-                if "colormap" in profile:
-                    src.write_colormap(1, profile["colormap"])
+                _add_metadata(src,profile)
                 if mask:
                     src.write_mask(False)
                 # todo include tags,scale,offset,desctription,units etc
@@ -209,6 +208,32 @@ def _empty_COG(profile: dict, rasterio_env_options: Optional[Dict] = None, mask:
         memfileio.seek(0)
         data_fixed = memfileio.read()
     return data_fixed
+
+
+
+def _add_metadata(rasterio_src,profile):
+    """Adds various metadata to the header"""
+    #profile first so others have higher priority (a number of them are tags anyway)
+    if "update_tags" in profile:  
+        for k,v in profile['update_tags'].items():
+            #i could not get namespaces to work -rasterio bug?
+            rasterio_src.update_tags(k,**v)
+            
+    if "descriptions" in profile:
+        rasterio_src.descriptions = profile['descriptions']
+    if "offsets" in profile:
+        rasterio_src.offsets = profile['offsets']
+    if "scales" in profile:
+        rasterio_src.scales = profile['scales']
+    if "units" in profile:
+        rasterio_src.units = profile['units']
+    if "colorinterp" in profile:
+        rasterio_src.colorinterp = profile['colorinterp']
+    if "write_colormap" in profile:
+        #note: rasterio suggests multiple colormaps can be a thing. I cant make it work -rasterio bug?
+        #for k,v in profile['write_colormap'].items():
+        #    rasterio_src.write_colormap(k,v)
+        rasterio_src.write_colormap(1,profile['write_colormap'])
 
 
 def _delete_COG_ghost_header(memfile: io.BytesIO):
@@ -721,30 +746,63 @@ def prep_tiff_header(parts_info: dict, profile: dict, rasterio_env_options: dict
         header_data = memfile.getvalue()
     return header_data
 
-
 def write_ccog(
     arr: Union[da.Array, xarray.DataArray, np.ndarray],
     mask: Optional[Union[da.Array, xarray.DataArray, np.ndarray]] = None,
     *,
     store: Optional[str] = None,
     COG_creation_options: Optional[Dict[str, any]] = None,
-    rasterio_env_options: Optional[Dict[str, any]] = None,
+    rasterio_env_options: Dict[str, any] = None,
     storage_options: Optional[Dict[str, any]] = None,
 ) -> Delayed:
     """Creates a dask graph that when computed produces a concatenated COG either as bytes or written to S3.
 
     If arr chunks are full width OR there height equals profile['blocksize'] then the GDAL COG ghost optimisations are retained
 
-    COG_creation_options can include most of the creation options specified here:
-    https://gdal.org/drivers/raster/cog.html
-    For resampling values of NEAREST/AVERAGE/MODE/RMS will result in a simpler dask graph and work faster and therfore should be prefered.
-    Values of BILINEAR/CUBIC/CUBICSPLINE/LANCZOS use a more complex graph to avoid edge effects.
+
 
     Args:
         arr (Union[da.Array, xarray.DataArray, np.ndarray]): The data array to write as a COG. It can be a dask array, xarray DataArray or numpy ndarray.
         mask (Optional[Union[da.Array, xarray.DataArray, np.ndarray]]): A mask array for the data. It can be a dask array, xarray DataArray or numpy ndarray. Default is None.
-        store (Optional[str]): An S3 file path or fsspec mapping. If not included, the function will produce dask graph that when computed produces a list of bytes that make up the COG file. Default is None.
-        COG_creation_options (Optional[Dict[str, any]]): Options for configuring the COG creation. Default is None.
+        store (Optional[str]): An S3 file path or fsspec mapping. If not included, the function will produce a dask graph that when computed produces a list of bytes that make up the COG file. Default is None.
+        COG_creation_options (Dict[str, any]): Options for configuring the COG creation.
+            This is required. OVERVIEW_RESAMPLING is needed as a minimum.
+            This is very similar to what is entered into rasterio.open.
+            There is no need to specify a path, mode,driver,width,height,count, dtype or sharing and if you do these will be ignored.
+            CRS, transform and nodata will be taken from the rioxarray rio accessor for a xarray DataArray, or can be input by the user. The users input takes precedence.
+            GCPS and RPCS are handled by rasterio if included.
+            
+            Additional creation options as specified by GDAL can also be included.
+            https://gdal.org/drivers/raster/cog.html
+            A few differences are noted here:
+            OVERVIEW_RESAMPLING is required by CCOG.
+                For resampling values of NEAREST/AVERAGE/MODE/RMS will result in a simpler dask graph and work faster and therfore should be prefered.
+                Values of BILINEAR/CUBIC/CUBICSPLINE/LANCZOS/GAUSS use a more complex graph to avoid edge effects.
+            BIGTIFF is always yes
+            GEOTIFF_VERSION defaults to 1.1
+            SPARSE_OK defaults to True
+            
+            The following are ignored or raise a ValueError.
+            OVERVIEWS,WARP_RESAMPLING,TILING_SCHEME,ZOOM_LEVEL,ZOOM_LEVEL_STRATEGY,TARGET_SRS,RES,EXTENT,ALIGNED_LEVELS and ADD_ALPHA
+
+            CCOG also extends this with additional creation options.
+            These represent other information that can be added to a COG file that are
+            normally set through the rasterio API at the time of writing the file.
+            Refer to the rasterio API for details on valid values for these options
+            
+            update_tags - a dict with integer keys where key 0 is dataset tags and 
+                tag 1 is tags for band 1 etc.
+                values are a dict of tags eg dict(tagname1x=0, tagname2='tag content') see
+                https://rasterio.readthedocs.io/en/latest/api/rasterio.io.html#rasterio.io.DatasetWriter.update_tags
+            descriptions - a list of strings: with one value per band in band order
+            offsets - a list of numbers: with one value per band in band order
+            scales - a list of numbers: with one value per band in band order
+            units - a list of strings: with one value per band in band order
+            colorinterp - a list with one value per band in band order see 
+                https://rasterio.readthedocs.io/en/latest/topics/color.html#color-interpretation
+            write_colormap - a colour dict as described here. Note only a single colormap applied to the first band is supported
+                https://rasterio.readthedocs.io/en/latest/topics/color.html#writing-colormaps
+
         rasterio_env_options (Optional[Dict[str, any]]): Options for configuring Rasterio's environment. Default is None.
         storage_options (Optional[Dict[str, any]]): Any additional parameters for the storage backend. Default is None.
 
