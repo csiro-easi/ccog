@@ -816,7 +816,7 @@ def write_ccog(
         profile["nodata"] = arr.rio.nodata
         arr = arr.data
         
-    if not isinstance(arr, np.ndarray):
+    if isinstance(arr, np.ndarray):
         arr = dask.array.from_array(arr)
 
     profile.update(user_creation_options)
@@ -853,7 +853,7 @@ def write_ccog(
             raise TypeError(" mask must be an instance of xarray DataArray or dask Array")
         if isinstance(mask, xarray.core.dataarray.DataArray):
             mask = mask.data
-        if not isinstance(mask, np.ndarray):
+        if isinstance(mask, np.ndarray):
             mask = dask.array.from_array(mask)
         if arr.chunks[-2:] != mask.chunks:
             raise ValueError("mask spatial chunks needs to match those of arr")
