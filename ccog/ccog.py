@@ -210,7 +210,6 @@ def _empty_COG(profile: dict, rasterio_env_options: Optional[Dict] = None, mask:
     return data_fixed
 
 
-
 def _add_metadata(rasterio_src,profile):
     """Adds various metadata to the header"""
     #profile first so others have higher priority (a number of them are tags anyway)
@@ -859,9 +858,6 @@ def write_ccog(
         raise ValueError(
             f"COG_creation_options needs to include a valid GDAL COG driver 'overview_resampling' selection"
         )
-
-    if not isinstance(arr, (xarray.core.dataarray.DataArray, dask.array.core.Array, np.ndarray)):
-        raise TypeError(" arr must be an instance of xarray DataArray or dask Array")
         
     # todo: raise error if required_creation_options are going to change user_creation_options
     # build the profile and env_options by layering sources sequentially making sure most important end up with precendence.
@@ -872,11 +868,7 @@ def write_ccog(
         profile["transform"] = arr.rio.transform()
         profile["crs"] = arr.rio.crs
         profile["nodata"] = arr.rio.nodata
-        arr = arr.data
         
-    if isinstance(arr, np.ndarray):
-        arr = dask.array.from_array(arr)
-
     profile.update(user_creation_options)
     profile.update(required_creation_options)
 
@@ -885,6 +877,8 @@ def write_ccog(
         raise ValueError(f"blocksize must be multiples of 16")
     profile["blockxsize"] = profile["blockysize"] = profile["blocksize"]
 
+    #handles a range of inputs that can be made into a dask array
+    arr = dask.array.asarray(arr)
     # handle single band data the same as multiband data
     if len(arr.shape) == 2:
         arr = arr.reshape([1] + [*arr.shape])
@@ -907,12 +901,8 @@ def write_ccog(
 
     # mask - check
     if mask is not None:
-        if not isinstance(mask, (xarray.core.dataarray.DataArray, dask.array.core.Array, np.ndarray)):
-            raise TypeError(" mask must be an instance of xarray DataArray or dask Array")
-        if isinstance(mask, xarray.core.dataarray.DataArray):
-            mask = mask.data
-        if isinstance(mask, np.ndarray):
-            mask = dask.array.from_array(mask)
+        #handles a range of inputs that can be made into a dask array
+        mask = dask.array.asarray(mask)
         if arr.chunks[-2:] != mask.chunks:
             raise ValueError("mask spatial chunks needs to match those of arr")
         # todo: also check CRS and transform match
