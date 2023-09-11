@@ -37,8 +37,14 @@ x_arr = xarray.open_zarr(.....)['......']
 #ccog is opinionated about the chunks it recieves (see the docs of write_ccog) 
 x_arr = x_arr.rechunk(chunks= 2**14)
 
+#choose settings for making the COG
+profile = dict(
+    compress= 'deflate',
+    overview_resampling = 'bilinear',
+)
+
 #make a writer - see the docs for more options
-delayed_writer = ccog.write_ccog(x_arr,store,storage_options=storage_options)
+delayed_writer = ccog.write_ccog(x_arr,store,COG_creation_options=profile,storage_options=storage_options)
 #compute it now or later on
 result = dask.compute(delayed_writer)
 
