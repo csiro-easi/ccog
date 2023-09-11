@@ -12,10 +12,10 @@ import rasterio
 import rioxarray
 import tifffile
 import xarray
-
 # from rasterio.rio.overview import get_maximum_overview_level
 from affine import Affine
 from dask.delayed import Delayed
+from more_itertools import collapse
 
 from . import aws_tools
 
@@ -816,7 +816,7 @@ def write_ccog(
         arr (Union[da.Array, xarray.DataArray, np.ndarray]): The data array to write as a COG. It can be a dask array, xarray DataArray or numpy ndarray.
         mask (Optional[Union[da.Array, xarray.DataArray, np.ndarray]]): A mask array for the data. It can be a dask array, xarray DataArray or numpy ndarray. Default is None.
             non zero or True values are valid data as per rasterio and GDAL (the opposite of numpy masked arrays)
-        store (Optional[str]): An S3 file path or fsspec mapping. If not included, the function will produce a dask graph that when computed produces a list of bytes that make up the COG file. Default is None.
+        store (Optional[str]): An S3 file path or fsspec mapping. If not included, the function will produce a dask graph that when computed produces bytes that make up the COG file. Default is None.
         COG_creation_options (Dict[str, any]): Options for configuring the COG creation.
             This is required. OVERVIEW_RESAMPLING is needed as a minimum.
             This is very similar to what is entered into rasterio.open.
@@ -965,4 +965,13 @@ def write_ccog(
     delayed_graph = _COG_graph_builder(arr, mask, profile=profile, rasterio_env_options=rasterio_env_options)
     if store:
         delayed_graph = aws_tools.mpu_upload_dask_partitioned(delayed_graph, store, storage_options=storage_options)
+    else:
+        delayed_graph = dask.delayed(collapse_bytes)(delayed_graph)
     return delayed_graph
+
+def collapse_bytes(nested_bytes):
+    """takes nested iterables of bytes and flattens"""
+    ba = bytearray()
+    for x in collapse(nested_bytes):
+        ba.extend(x)
+    return bytes(ba)
