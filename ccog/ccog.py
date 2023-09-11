@@ -35,6 +35,7 @@ default_creation_options = dict(
     geotiff_version=1.1,  # why not use the latest by default
     blocksize=512,
     cog_ghost_data=False,
+    statistics = True, #seems reasonable except the implementation might be slow. would rather work to speed up implemenation then switch it off by default
 )
 
 # these must be even
@@ -209,8 +210,6 @@ def _empty_COG(profile: dict, rasterio_env_options: Optional[Dict] = None, mask:
         data_fixed = memfileio.read()
     return data_fixed
 
-
-
 def _add_metadata(rasterio_src,profile):
     """Adds various metadata to the header"""
     #profile first so others have higher priority (a number of them are tags anyway)
@@ -234,7 +233,7 @@ def _add_metadata(rasterio_src,profile):
         #for k,v in profile['write_colormap'].items():
         #    rasterio_src.write_colormap(k,v)
         rasterio_src.write_colormap(1,profile['write_colormap'])
-
+        
 
 def _delete_COG_ghost_header(memfile: io.BytesIO):
     """Delete the COG ghost header from a memory file.
@@ -509,6 +508,52 @@ def _unoverlap_slices(shape, overlap):
         arr[:, 0:-1, 3] = -overlap
     return arr.reshape((-1, 4))
 
+def _calc_stats_for_profile(profile,arr,mask=None):
+    """
+    set up simple stats calculation and return calculation graph
+    
+    Both mask an nodata value are used to exclude values from the calculation if present. Any alpha band is not used as a mask.
+    
+    Statistics wont exactly match gdal output due to not using the same calculation path
+    """
+    # will be interesting to see has dask handles optimising this in the task graph
+    # if the impact on the graph and its handling is high then this could be combined  into the tif part maker.
+    #however note that the std dev calc in dask is carefully written to avoid accumulating floating point errors.
+    
+    # example statistics tags from a cog file
+    # <Item name="STATISTICS_MAXIMUM" sample="0">200.234512345</Item>
+    # <Item name="STATISTICS_MEAN" sample="0">1.1139785539731</Item>
+    # <Item name="STATISTICS_MINIMUM" sample="0">1</Item>
+    # <Item name="STATISTICS_STDDEV" sample="0">4.7639763336794</Item>
+    # <Item name="STATISTICS_VALID_PERCENT" sample="0">85.35</Item>
+    
+    if mask is None:
+        mask = 1
+
+    #im sure there is a neater way to write this
+    if 'nodata' in profile and mask is not None:
+        fullmask =np.logical_or(arr ==profile['nodata'], np.logical_not(mask))
+    else:
+        fullmask = np.logical_not(mask)
+    arr = dask.array.ma.masked_array(arr,fullmask)
+
+    stats = (arr.max(axis=(1,2)),arr.mean(axis=(1,2)),arr.min(axis=(1,2)),arr.std(axis=(1,2)),100*(1-fullmask.mean(axis=(1,2))))
+    return stats
+
+def _add_stats_to_profile_tags(profile,stats):
+    tags = profile.get('update_tags', {})
+    for id, band_stats in enumerate(zip(*stats),1):
+        band_tags = tags.get(id, {})
+        if band_stats[4] > 0.0:
+            band_tags['STATISTICS_MAXIMUM'] = band_stats[0]
+            band_tags['STATISTICS_MEAN'] = band_stats[1]
+            band_tags['STATISTICS_MINIMUM'] = band_stats[2]
+            band_tags['STATISTICS_STDDEV'] = band_stats[3]
+        band_tags['STATISTICS_VALID_PERCENT'] = band_stats[4]
+        tags[id] = band_tags
+    profile['update_tags'] = tags
+    return profile
+
 
 def _COG_graph_builder(
     arr: da.Array, mask: Optional[da.Array], profile: Dict[str, any], rasterio_env_options: Dict[str, any]
@@ -528,6 +573,7 @@ def _COG_graph_builder(
     Returns:
         dask.delayed: A Dask delayed object representing the computation graph to build the COG.
     """
+    mask_flag = mask is not None
     tif_part_maker_func = dask.delayed(_partial_COG_maker, nout=4)
 
     # ensure the overview count is set
@@ -547,6 +593,11 @@ def _COG_graph_builder(
     current_level_profile = del_profile
     parts_info = {}
     parts_bytes = {}
+    
+    if profile['statistics']:
+        stats = _calc_stats_for_profile(profile,arr,mask)
+        del_stats = dask.delayed(_add_stats_to_profile_tags, traverse=False)
+        del_profile_with_stats = del_stats(del_profile,stats)
 
     for level in range(profile["overview_count"] + 1):
         arr = _chunk_adjuster(arr)
@@ -570,7 +621,7 @@ def _COG_graph_builder(
         res_arr = np.ndarray((len(chunk_heights), len(chunk_widths)), dtype=object)
 
         mask_del = []
-        if mask is not None:
+        if mask_flag:
             mask = _chunk_adjuster(mask)
             if overlap_count:
                 mask = dask.array.overlap.overlap(mask, (overlap_count, overlap_count), "none", allow_rechunk=False)
@@ -594,20 +645,20 @@ def _COG_graph_builder(
                     max(1, chunk_widths[ind[1]] // 2),
                 )
                 res_arr[ind] = dask.array.from_delayed(overview_arr, shape=blk_final_shape, dtype=arr.dtype)
-                if mask is not None:
+                if mask_flag:
                     mask_res_arr[ind] = dask.array.from_delayed(mask_arr, shape=blk_final_shape[-2:], dtype=mask.dtype)
 
         arr = dask.array.block(res_arr.tolist())
         # copy the chunking from the initial data - assuming the first chunk is indicative of appropriate chunking to use for overviews
         arr = arr.rechunk(chunks=(chunk_depth[0], chunk_heights[0], chunk_widths[0]))
-        if mask is not None:
+        if mask_flag:
             mask = dask.array.block(mask_res_arr.tolist())
             mask = mask.rechunk(chunks=(chunk_heights[0], chunk_widths[0]))
 
         current_level_profile = del_overview_profile
 
     header_bytes_final = dask.delayed(prep_tiff_header)(
-        parts_info, del_profile, del_rasterio_env_options, mask=mask is not None
+        parts_info, del_profile_with_stats, del_rasterio_env_options, mask=mask_flag
     )
     # sum as a shorthand for flattening a list in the right order
     delayed_parts = sum([v for k, v in sorted(parts_bytes.items(), reverse=True)], [header_bytes_final])
@@ -764,6 +815,7 @@ def write_ccog(
     Args:
         arr (Union[da.Array, xarray.DataArray, np.ndarray]): The data array to write as a COG. It can be a dask array, xarray DataArray or numpy ndarray.
         mask (Optional[Union[da.Array, xarray.DataArray, np.ndarray]]): A mask array for the data. It can be a dask array, xarray DataArray or numpy ndarray. Default is None.
+            non zero or True values are valid data as per rasterio and GDAL (the opposite of numpy masked arrays)
         store (Optional[str]): An S3 file path or fsspec mapping. If not included, the function will produce a dask graph that when computed produces a list of bytes that make up the COG file. Default is None.
         COG_creation_options (Dict[str, any]): Options for configuring the COG creation.
             This is required. OVERVIEW_RESAMPLING is needed as a minimum.
@@ -786,22 +838,23 @@ def write_ccog(
             OVERVIEWS,WARP_RESAMPLING,TILING_SCHEME,ZOOM_LEVEL,ZOOM_LEVEL_STRATEGY,TARGET_SRS,RES,EXTENT,ALIGNED_LEVELS and ADD_ALPHA
 
             CCOG also extends this with additional creation options.
-            These represent other information that can be added to a COG file that are
-            normally set through the rasterio API at the time of writing the file.
-            Refer to the rasterio API for details on valid values for these options
-            
-            update_tags - a dict with integer keys where key 0 is dataset tags and 
-                tag 1 is tags for band 1 etc.
-                values are a dict of tags eg dict(tagname1x=0, tagname2='tag content') see
-                https://rasterio.readthedocs.io/en/latest/api/rasterio.io.html#rasterio.io.DatasetWriter.update_tags
-            descriptions - a list of strings: with one value per band in band order
-            offsets - a list of numbers: with one value per band in band order
-            scales - a list of numbers: with one value per band in band order
-            units - a list of strings: with one value per band in band order
-            colorinterp - a list with one value per band in band order see 
-                https://rasterio.readthedocs.io/en/latest/topics/color.html#color-interpretation
-            write_colormap - a colour dict as described here. Note only a single colormap applied to the first band is supported
-                https://rasterio.readthedocs.io/en/latest/topics/color.html#writing-colormaps
+                These represent other information that can be added to a COG file that are
+                normally set through the rasterio API at the time of writing the file.
+                Refer to the rasterio API for details on valid values for these options
+
+                update_tags - a dict with integer keys where key 0 is dataset tags and 
+                    tag 1 is tags for band 1 etc.
+                    values are a dict of tags eg dict(tagname1x=0, tagname2='tag content') see
+                    https://rasterio.readthedocs.io/en/latest/api/rasterio.io.html#rasterio.io.DatasetWriter.update_tags
+                descriptions - a list of strings: with one value per band in band order
+                offsets - a list of numbers: with one value per band in band order
+                scales - a list of numbers: with one value per band in band order
+                units - a list of strings: with one value per band in band order
+                colorinterp - a list with one value per band in band order see 
+                    https://rasterio.readthedocs.io/en/latest/topics/color.html#color-interpretation
+                write_colormap - a colour dict as described here. Note only a single colormap applied to the first band is supported
+                    https://rasterio.readthedocs.io/en/latest/topics/color.html#writing-colormaps
+                statistics - (bool): adds standard statistics to each bands tags. Defaults to True.
 
         rasterio_env_options (Optional[Dict[str, any]]): Options for configuring Rasterio's environment. Default is None.
         storage_options (Optional[Dict[str, any]]): Any additional parameters for the storage backend. Default is None.
@@ -859,9 +912,6 @@ def write_ccog(
         raise ValueError(
             f"COG_creation_options needs to include a valid GDAL COG driver 'overview_resampling' selection"
         )
-
-    if not isinstance(arr, (xarray.core.dataarray.DataArray, dask.array.core.Array, np.ndarray)):
-        raise TypeError(" arr must be an instance of xarray DataArray or dask Array")
         
     # todo: raise error if required_creation_options are going to change user_creation_options
     # build the profile and env_options by layering sources sequentially making sure most important end up with precendence.
@@ -872,11 +922,7 @@ def write_ccog(
         profile["transform"] = arr.rio.transform()
         profile["crs"] = arr.rio.crs
         profile["nodata"] = arr.rio.nodata
-        arr = arr.data
         
-    if isinstance(arr, np.ndarray):
-        arr = dask.array.from_array(arr)
-
     profile.update(user_creation_options)
     profile.update(required_creation_options)
 
@@ -885,6 +931,8 @@ def write_ccog(
         raise ValueError(f"blocksize must be multiples of 16")
     profile["blockxsize"] = profile["blockysize"] = profile["blocksize"]
 
+    #handles a range of inputs that can be made into a dask array
+    arr = dask.array.asarray(arr)
     # handle single band data the same as multiband data
     if len(arr.shape) == 2:
         arr = arr.reshape([1] + [*arr.shape])
@@ -907,12 +955,8 @@ def write_ccog(
 
     # mask - check
     if mask is not None:
-        if not isinstance(mask, (xarray.core.dataarray.DataArray, dask.array.core.Array, np.ndarray)):
-            raise TypeError(" mask must be an instance of xarray DataArray or dask Array")
-        if isinstance(mask, xarray.core.dataarray.DataArray):
-            mask = mask.data
-        if isinstance(mask, np.ndarray):
-            mask = dask.array.from_array(mask)
+        #handles a range of inputs that can be made into a dask array
+        mask = dask.array.asarray(mask)
         if arr.chunks[-2:] != mask.chunks:
             raise ValueError("mask spatial chunks needs to match those of arr")
         # todo: also check CRS and transform match
