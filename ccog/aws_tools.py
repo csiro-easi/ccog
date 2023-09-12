@@ -97,22 +97,7 @@ class Mpu:
         """
         if self.finalised:
             return
-        if data is None:
-            return
-
-        # being flexible to accept (nested) iterables of bytes)
-        if not isinstance(data, (bytes, bytearray, str)):
-            bytes_arr = bytearray()
-            for p in collapse(data, base_type=bytearray):
-                bytes_arr.extend(p)
-            data = bytes_arr
-
-        if isinstance(data, bytearray):
-            # need to cast to bytes - unfortunatly doubles memory usage
-            data = bytes(data)
-
-        if len(data) == 0:
-            return
+        data = _flatten_bytes(data)
 
         part_mpu = self.store.fs.call_s3(
             "upload_part",
@@ -182,6 +167,28 @@ class Mpu:
         self.finalised = True
         return result
 
+def _flatten_bytes(*data):
+    """
+    takes arbitarily nestes list/tubles of bytes/bytesarray and flattens to bytes
+    """
+    if data is None:
+        return
+
+    # being flexible to accept (nested) iterables of bytes)
+    if not isinstance(data, (bytes, bytearray, str)):
+        bytes_arr = bytearray()
+        for p in collapse(data, base_type=bytearray):
+            bytes_arr.extend(p)
+        data = bytes_arr
+
+    if isinstance(data, bytearray):
+        # need to cast to bytes - unfortunatly doubles memory usage
+        data = bytes(data)
+
+    if len(data) == 0:
+        return
+    return data
+    
 
 def mpu_upload_dask_partitioned(ordered_parts, store, storage_options=None):
     """
@@ -234,17 +241,26 @@ def mpu_write_planner(part1, part2):
     if sum(len(x) for x in collapse(parts_A)) < s3_min_part_bytes:
         assert not parts_B, "mmm data where it shouldnt be"
         parts_A.extend(parts_C)
-        id_C = None
-        parts_C = []
         return [[id_A, parts_A], [id_D, parts_D]], []
     else:
-        id_B = id_C
         parts_B.extend(parts_C)
-        id_C = None
-        parts_C = []
         # if second part makes it to here but it is too small to write it becomes the third part.
         # otherwise it stays as the second part and gets written
         if sum(len(x) for x in collapse(parts_B)) < s3_min_part_bytes:
+            if id_A + 1 == id_C:
+                #there are no writes already between these so we can merge them and write most of the data
+                data = _flatten_bytes(parts_A,parts_B)
+                if len(data) < s3_min_part_bytes:
+                    return [[id_A, [data]], [None, []]], []
+                
+                split_at = s3_min_part_bytes
+                if len(data) >= (s3_max_part_bytes + s3_min_part_bytes):
+                    split_at = len(data)-s3_max_part_bytes
+                return [[id_A, [data[:split_at]]], [None, []]], [id_C, [data[split_at:]]]
+
+                    
+                    
+            
             return [[id_A, parts_A], [id_B, parts_B]], []
         else:
             return [[id_A, parts_A], [id_D, parts_D]], [[id_B, parts_B]]
