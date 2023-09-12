@@ -256,11 +256,8 @@ def mpu_write_planner(part1, part2):
                 split_at = s3_min_part_bytes
                 if len(data) >= (s3_max_part_bytes + s3_min_part_bytes):
                     split_at = len(data)-s3_max_part_bytes
-                return [[id_A, [data[:split_at]]], [None, []]], [id_C, [data[split_at:]]]
+                return [[id_A, [data[:split_at]]], [None, []]], [[id_C, [data[split_at:]]]]
 
-                    
-                    
-            
             return [[id_A, parts_A], [id_B, parts_B]], []
         else:
             return [[id_A, parts_A], [id_D, parts_D]], [[id_B, parts_B]]
