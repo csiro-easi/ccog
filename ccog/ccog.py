@@ -801,7 +801,7 @@ def prep_tiff_header(parts_info: dict, profile: dict, rasterio_env_options: dict
 
 
 def delayed_ccog_parts(
-    arr: da.Array, mask: Optional[da.Array], profile: Dict[str, any], rasterio_env_options: Dict[str, any]
+    arr: da.Array, mask: Optional[da.Array], COG_creation_options: Dict[str, any], rasterio_env_options: Dict[str, any]
     ) -> dask.delayed:
     """
     Makes a dask delayed graph that, when computed, writes a COG file to S3.
@@ -818,6 +818,8 @@ def delayed_ccog_parts(
     Returns:
         dask.delayed: A Dask delayed object representing the computation graph to build the COG.
     """
+    COG_creation_options = {} if COG_creation_options is None else COG_creation_options
+    rasterio_env_options = {} if rasterio_env_options is None else rasterio_env_options
     
     # normalise keys and string values to lower case for ease of use
     user_creation_options = {
@@ -976,12 +978,10 @@ def write_ccog(
         Delayed: A dask.delayed object representing the process of creating the COG.
     """
 
-    COG_creation_options = {} if COG_creation_options is None else COG_creation_options
-    rasterio_env_options = {} if rasterio_env_options is None else rasterio_env_options
     storage_options = {} if storage_options is None else storage_options
 
     # building the delayed graph
-    delayed_graph = delayed_ccog_parts(arr, mask, profile=profile, rasterio_env_options=rasterio_env_options)
+    delayed_graph = delayed_ccog_parts(arr, mask, COG_creation_options=COG_creation_options, rasterio_env_options=rasterio_env_options)
     if store:
         delayed_graph = aws_tools.mpu_upload_dask_partitioned(delayed_graph, store, storage_options=storage_options)
     else:
