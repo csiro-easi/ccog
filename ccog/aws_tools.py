@@ -139,13 +139,7 @@ class Mpu:
         """
         if self.finalised:
             return
-        # flatten and make sure parts are sorted and filter out any skipped parts
-        parts = []
-        for part in mpu_parts:
-            if isinstance(part, list):
-                parts.extend(part)
-            elif part is not None:
-                parts.append(part)
+        parts = collapse(test,base_type=dict)
         parts = sorted(parts, key=lambda y: y["PartNumber"])
         # print (parts)
         try:
