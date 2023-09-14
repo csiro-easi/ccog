@@ -139,7 +139,7 @@ class Mpu:
         """
         if self.finalised:
             return
-        parts = collapse(test,base_type=dict)
+        parts = collapse(mpu_parts,base_type=dict)
         parts = sorted(parts, key=lambda y: y["PartNumber"])
         # print (parts)
         try:

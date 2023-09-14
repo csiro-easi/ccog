@@ -804,10 +804,14 @@ def delayed_ccog_parts(
     arr: da.Array, mask: Optional[da.Array], COG_creation_options: Dict[str, any], rasterio_env_options: Dict[str, any]
     ) -> dask.delayed:
     """
-    Makes a dask delayed graph that, when computed, writes a COG file to S3.
+    Makes a list of related delayed graphs that, when computed, return bytes that when concatenated form a COG file.
+    
+    This is more specialised functionality. Write_ccog should be prefered over this function.
+    This function is available for a use case where you want to "stream" a larger then memory COG file to a storage other then S3.
 
-    This function constructs a Dask delayed computation graph for creating a COG file from a Dask array.
-    It splits the array into parts, processes them, and returns a delayed computation graph to build the COG.
+    Note that if you call each part sequentually the COG will be computed multiple times.
+    The easiest way to use this is to persist the whole list to a large enough cluster and then sequentially compute and store the items in the persisted list.
+    Alternativly the graph can be built upon further as is done in write_ccog
 
     Args:
         arr (dask.array.Array): The Dask array to create a COG from.
