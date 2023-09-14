@@ -98,7 +98,8 @@ class Mpu:
         if self.finalised:
             return
         data = _flatten_bytes(data)
-
+        if len(data) == 0:
+            return
         part_mpu = self.store.fs.call_s3(
             "upload_part",
             Bucket=self.mpu["Bucket"],
@@ -185,8 +186,6 @@ def _flatten_bytes(*data):
         # need to cast to bytes - unfortunatly doubles memory usage
         data = bytes(data)
 
-    if len(data) == 0:
-        return
     return data
     
 
