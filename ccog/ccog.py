@@ -34,11 +34,12 @@ default_creation_options = dict(
     sparse_ok=True,
     geotiff_version=1.1,  # why not use the latest by default
     blocksize=512,
+    compress = 'lzw', #this is the gdal default
     cog_ghost_data=False,
     statistics = True, #seems reasonable except the implementation might be slow. would rather work to speed up implemenation then switch it off by default
 )
 
-# these must be even
+# these must be even due to the 2 by resample for overviews
 # based on testing with GDAL
 resample_overlaps = {
     "nearest": 0,
@@ -944,8 +945,9 @@ def write_ccog(
     if len(arr.chunks) == 3 and len(arr.chunks[0]) > 1:
         raise ValueError("non spatial dimension chunking needs to be a single chunk")
 
-    # keep the ghost data if the chunking allows it
-    if all([dim == profile["blocksize"] for dim in arr.chunks[-2][:-1]]) or len(arr.chunks[-1]) == 1:
+    # keep the ghost data if the chunking allows it and the user hasnt specified it
+    # would be reasonable for a user to set it to False. Setting it to True would be counter productive as the result may not conform to the GDAL spec for this
+    if "cog_ghost_data" not in user_creation_options and (all([dim == profile["blocksize"] for dim in arr.chunks[-2][:-1]]) or len(arr.chunks[-1]) == 1):
         profile["cog_ghost_data"] = True
 
     profile["count"] = arr.shape[0]
