@@ -81,9 +81,7 @@ class Mpu:
         self.store = _resolve_store(store, storage_options)
         self.bucket, self.key, _ = self.store.fs.split_path(self.store.root)
         # start the mpy abd store the mpu details with the store
-        self.mpu = self.store.fs.call_s3(
-            "create_multipart_upload", Bucket=self.bucket, Key=self.key, **mpu_options
-        )
+        self.mpu = self.store.fs.call_s3("create_multipart_upload", Bucket=self.bucket, Key=self.key, **mpu_options)
 
     def upload_part_mpu(self, PartNumber, data):
         """Uploads a part to a multipart upload.
@@ -109,6 +107,7 @@ class Mpu:
             Key=self.mpu["Key"],
         )
         return {"PartNumber": PartNumber, "ETag": part_mpu["ETag"]}
+        
 
     def upload_parts_mpu(self, write_parts):
         """Uploads multiple part to a multipart upload.
@@ -139,7 +138,7 @@ class Mpu:
         """
         if self.finalised:
             return
-        parts = collapse(mpu_parts,base_type=dict)
+        parts = (p for p in collapse(mpu_parts,base_type=dict) if p is not None)
         parts = sorted(parts, key=lambda y: y["PartNumber"])
         # print (parts)
         try:
@@ -203,12 +202,9 @@ def mpu_upload_dask_partitioned(ordered_parts, store, storage_options=None):
         if len(x)
     ]
 
+    count = 0
     while parts:
-        if len(parts) == 1:
-            # deal with the last part
-            mpu_parts.append(mpu_writer_func(parts.pop()))
-            break
-
+        count +=1000000
         parts_temp = []
         # access parts in pairs
         for part1, part2 in zip_longest(parts[0::2], parts[1::2], fillvalue=None):
@@ -216,38 +212,60 @@ def mpu_upload_dask_partitioned(ordered_parts, store, storage_options=None):
                 # not a pair - send it straight up to the next level
                 parts_temp.append(part1)
             else:
-                buffers, writes = mpu_write_planner_func(part1, part2)
+                count +=1
+                buffers, writes = mpu_write_planner_func(part1, part2,seq = count)
                 parts_temp.append(buffers)
                 mpu_parts.append(mpu_writer_func(writes))
-
+        if len(parts_temp) == 1:
+            # deal with the last part
+            mpu_parts.append(mpu_writer_func(parts_temp[0]))
+            break
         parts = parts_temp
 
     delayed_graph = mpu_complete_func(mpu_parts)
     return delayed_graph
 
 
-def mpu_write_planner(part1, part2):
+def mpu_write_planner(part1, part2,seq):
+    #the effective current part size limit is 10GiB for a pair of parts
+    #todo: there is a variation of this that looks to spread parts larger then s3_max_part_bytes over any unused IDs that have been merged in a previous iteration
+    # this might help in the case of a very large part next to a run of very small parts
+    #todo: could use a s3_min_part_bytes much larger (can already do this part) than 5MiB to free up IDs in the tree for the above
     [id_A, parts_A], [id_B, parts_B] = part1
     [id_C, parts_C], [id_D, parts_D] = part2
     
+    parts_A = _flatten_bytes(parts_A)
+    parts_B = _flatten_bytes(parts_B)
+    parts_C = _flatten_bytes(parts_C)
+    parts_D = _flatten_bytes(parts_D)
+    #debug = (seq,(id_A,len(parts_A)/1024/1024//1),(id_B,len(parts_B)/1024/1024//1),(id_C,len(parts_C)/1024/1024//1),(id_D,len(parts_D)/1024/1024//1))
+           
     #neighbouring ids can be merged - note part B will be empty
-    if id_A + 1 == id_C:
+    # as there cant have been any writes between a and c if a is too short
+    if id_A + 1 == id_C or len(parts_A) < s3_min_part_bytes:
+        assert len(parts_B) == 0 , 'assumption is wrong'
         parts_A,parts_C = _combine_and_split (parts_A,parts_C)
         
     #now handle part B
-    if id_B:
+    if len(parts_B):
         parts_B,parts_C = _combine_and_split (parts_B,parts_C)
-        if len(parts_B) < s3_min_part_bytes:
-            #parts_C will be empty - use id_C to enable merging in the next iteration
-            return [[id_A, parts_A], [id_C, parts_B]], []
+    else:
+        #part c when there is no part b
+        id_B,parts_B = (id_C,parts_C)
+        id_C,parts_C = (None,[])
+        
+    #print ((seq,(id_A,len(parts_A)/1024/1024//1),(id_B,len(parts_B)/1024/1024//1),(id_C,len(parts_C)/1024/1024//1),(id_D,len(parts_D)/1024/1024//1),debug))
+    if len(parts_B) >= s3_min_part_bytes:
         return [[id_A, parts_A], [id_D, parts_D]], [[id_B, parts_B],[id_C, parts_C]]
-    
-    if len(parts_C) < s3_min_part_bytes:
-        return [[id_A, parts_A], [id_C, parts_C]], []
-    return [[id_A, parts_A], [id_D, parts_D]], [[id_C, parts_C]]   
+    # if b is short then c is empty and if b is short there cant be a d
+    # as there cant have been any writes between c and e(after d)
+    return [[id_A, parts_A], [id_B, parts_B]], []
+        
+
     
     
 def _combine_and_split (parts_1,parts_2):
+    assert s3_max_part_bytes >= 2* s3_min_part_bytes, 'assumption is wrong'
     data = _flatten_bytes(parts_1,parts_2)
     #split into 2 parts
     second_part_len = max(0,min(len(data)-s3_min_part_bytes,s3_max_part_bytes))
@@ -256,3 +274,6 @@ def _combine_and_split (parts_1,parts_2):
     split_at = len(data) - second_part_len
 
     return( data[:split_at], data[split_at:])
+
+
+
