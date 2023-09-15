@@ -1,4 +1,4 @@
-__all__ = ["write_ccog"]
+__all__ = ["write_ccog","delayed_ccog_parts"]
 
 import io
 import math
@@ -801,8 +801,11 @@ def prep_tiff_header(parts_info: dict, profile: dict, rasterio_env_options: dict
 
 
 def delayed_ccog_parts(
-    arr: da.Array, mask: Optional[da.Array], COG_creation_options: Dict[str, any], rasterio_env_options: Dict[str, any]
-    ) -> dask.delayed:
+    arr: Union[da.Array, xarray.DataArray, np.ndarray],
+    mask: Optional[Union[da.Array, xarray.DataArray, np.ndarray]] = None,
+    COG_creation_options: Optional[Dict[str, any]] = None,
+    rasterio_env_options: Dict[str, any] = None,
+    ) -> Delayed:
     """
     Makes a list of related delayed graphs that, when computed, return bytes that when concatenated form a COG file.
     
@@ -812,12 +815,27 @@ def delayed_ccog_parts(
     Note that if you call each part sequentually the COG will be computed multiple times.
     The easiest way to use this is to persist the whole list to a large enough cluster and then sequentially compute and store the items in the persisted list.
     Alternativly the graph can be built upon further as is done in write_ccog
+    
+    ```
+    #make a graph
+    dd = ccog.ccog.delayed_ccog_parts(da,COG_creation_options=cog_options,)
+    #persist on a large enough cluster
+    pdd = dask.persist(*dd)
+    #Get the first bytes object (the tif headers)
+    pdd[0].compute()
+    #Get the second bytes object (the compressed last overview)
+    pdd[1].compute()
+    #etc
+    #write a for part in pdd: loop to put the data into a file
+    ```
 
     Args:
         arr (dask.array.Array): The Dask array to create a COG from.
         mask (dask.array.Array or None): An optional mask array for the COG.
         profile (dict): A dictionary containing the COG profile settings.
         rasterio_env_options (dict): A dictionary containing Rasterio environment options.
+        
+        See write_ccog for more information
 
     Returns:
         dask.delayed: A Dask delayed object representing the computation graph to build the COG.
