@@ -35,12 +35,12 @@ x_arr = xarray.open_zarr(.....)['......']
 #do some processing on it.... whatever you want
 #make sure you think about chunking either at read time or later on
 #ccog is opinionated about the chunks it recieves (see the docs of write_ccog) 
-x_arr = x_arr.rechunk(chunks= 2**14)
+x_arr = x_arr.rechunk(chunks= 512*8)
 
 #choose settings for making the COG
 profile = dict(
     compress= 'deflate',
-    overview_resampling = 'bilinear',
+    overview_resampling = 'average',
 )
 
 #make a writer - see the docs for more options
