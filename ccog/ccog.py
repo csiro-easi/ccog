@@ -35,7 +35,7 @@ default_creation_options = dict(
     geotiff_version=1.1,  # why not use the latest by default
     blocksize=512,
     cog_ghost_data=False,
-    statistics = True, #seems reasonable except the implementation might be slow. would rather work to speed up implemenation then switch it off by default
+    statistics = False, #setting to false as performace is terrible
 )
 
 # these must be even
@@ -594,10 +594,11 @@ def _COG_graph_builder(
     parts_info = {}
     parts_bytes = {}
     
+    del_header_profile = del_profile
     if profile['statistics']:
         stats = _calc_stats_for_profile(profile,arr,mask)
         del_stats = dask.delayed(_add_stats_to_profile_tags, traverse=False)
-        del_profile_with_stats = del_stats(del_profile,stats)
+        del_header_profile = del_stats(del_profile,stats)
 
     for level in range(profile["overview_count"] + 1):
         arr = _chunk_adjuster(arr)
@@ -658,7 +659,7 @@ def _COG_graph_builder(
         current_level_profile = del_overview_profile
 
     header_bytes_final = dask.delayed(prep_tiff_header)(
-        parts_info, del_profile_with_stats, del_rasterio_env_options, mask=mask_flag
+        parts_info, del_header_profile, del_rasterio_env_options, mask=mask_flag
     )
     # sum as a shorthand for flattening a list in the right order
     delayed_parts = sum([v for k, v in sorted(parts_bytes.items(), reverse=True)], [header_bytes_final])
