@@ -35,7 +35,7 @@ default_creation_options = dict(
     geotiff_version=1.1,  # why not use the latest by default
     blocksize=512,
     cog_ghost_data=False,
-    statistics = True, #seems reasonable except the implementation might be slow. would rather work to speed up implemenation then switch it off by default
+    statistics = False, #setting to false as performace is terrible
 )
 
 # these must be even
