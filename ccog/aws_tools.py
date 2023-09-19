@@ -154,12 +154,7 @@ class Mpu:
         if self.finalised:
             return
         # flatten and make sure parts are sorted and filter out any skipped parts
-        parts = []
-        for part in mpu_parts:
-            if isinstance(part, list):
-                parts.extend(part)
-            elif part is not None:
-                parts.append(part)
+        parts = (p for p in collapse(mpu_parts,base_type=dict) if p is not None)
         parts = sorted(parts, key=lambda y: y["PartNumber"])
         # print (parts)
         try:
@@ -172,7 +167,7 @@ class Mpu:
             )
         except:
             print("multipart upload failed")
-            _ = self.store.fs.call_s3(
+            result = self.store.fs.call_s3(
                 "abort_multipart_upload",
                 Bucket=self.mpu["Bucket"],
                 Key=self.mpu["Key"],
