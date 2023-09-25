@@ -277,8 +277,8 @@ def _test_jpegtables(JPEGTables: bytes, profile: Dict, rasterio_env_options: Opt
         None
     """
     profile = profile.copy()
-    profile["height"] = 512
-    profile["width"] = 512
+    profile["height"] = profile["blocksize"]
+    profile["width"] = profile["blocksize"]
     with rasterio.Env(**rasterio_env_options):
         with rasterio.io.MemoryFile() as memfile:
             with memfile.open(**profile) as src:
@@ -388,19 +388,17 @@ def _partial_COG_maker(
             - len(part_bytes) (int): Length of part_bytes.
     """
 
-    overview_arr, mask_overview_arr, file_bytes = _overview_maker(arr, mask, overlap_map, profile, rasterio_env_options)
-    if not (overlap_map == None).all():
-        # if resampling requires overlaps then the creation of the overview has to happed seperate to the creation of the main image data.
-        overview_arr, mask_overview_arr, _ = _overview_maker(
-            arr, mask, overlap_map, profile, rasterio_env_options, return_file=False
-        )
+    
+    if (overlap_map == None).all():
+        overview_arr, mask_overview_arr, file_bytes = _overview_maker(arr, mask, overlap_map, profile, rasterio_env_options)
+    else:
+        # if resampling requires overlaps then the creation of the overview has to happen seperate to the creation of the main image data.
+        overview_arr, mask_overview_arr, _ = _overview_maker(arr, mask, overlap_map, profile, rasterio_env_options, return_file=False)
         # strip the overlap from arr and mask
         arr = arr[:, slice(*overlap_map[:2]), slice(*overlap_map[-2:])]
         if mask is not None:
             mask = mask[slice(*overlap_map[:2]), slice(*overlap_map[-2:])]
-        _, _, file_bytes = _overview_maker(
-            arr, mask, overlap_map, profile, rasterio_env_options, return_overviews=False
-        )
+        _, _, file_bytes = _overview_maker(arr, mask, overlap_map, profile, rasterio_env_options, return_overviews=False)
 
     with io.BytesIO(file_bytes) as memfile, tifffile.TiffFile(memfile) as tif:
         page = tif.pages[0]
